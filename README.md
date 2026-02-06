@@ -83,6 +83,190 @@ difficultyScore = weighted composite metric
 
 ---
 
+##### Difficulty Quantification Model 設計原則
+
+本プロジェクトにおける難易度（difficulty）は主観評価ではなく、観測可能な構造的特徴量の合成指標として定義する。
+
+難易度は以下4軸に分解される：
+
+* Lexical Complexity（語彙難易度）
+* Structural Complexity（構文深度）
+* Semantic Ambiguity（選択肢の紛らわしさ）
+* Reasoning Depth（推論段階数）
+
+各指標は 0〜1 に正規化され、最終的に重み付き線形結合で統合される。
+
+##### 正規化方針（0〜1スケール）
+
+すべての指標は以下の Min-Max 正規化を使用する：
+
+```
+X_norm = (X - X_min) / (X_max - X_min)
+```
+
+設定方法
+
+* 初期値は理論上想定される範囲で固定する
+* 将来的には観測データ分布に基づき更新可能
+
+例：
+
+| 指標 | Xmin | Xmax |
+| --- | --- | --- |
+| 単語数 | 5 | 150 |
+| 文数 | 1 | 10 |
+| 推論段階 | 1 | 5 |
+
+これにより difficultyScore は常に 0〜1 に収束する。
+
+##### 各構成要素の定義
+
+1. Lexical Complexity（L）
+
+構成要素
+
+* 単語数（word_count）
+* 平均単語長（avg_word_length）
+
+理論背景
+
+語彙量と単語長は処理負荷と相関する。
+短文かつ単純語彙は認知負荷が低い。
+
+定義式
+
+```
+L = 0.5 * WC_norm + 0.5 * AWL_norm
+```
+
+均等重みとする理由：
+
+* 両者は同じ lexical complexity 軸に属する
+* 相関はあるが完全一致しないため分離
+
+2. Structural Complexity（S）
+
+構成要素
+
+* 文の数（sentence_count）
+* 接続詞数（conjunction_count）
+* 従属節指標（簡易：接続詞ベース）
+
+理論背景
+
+構文が深いほどワーキングメモリ負荷が増大する。
+
+定義式
+
+```
+S = 0.6 * Clause_norm + 0.4 * Sentence_norm
+```
+
+理由：
+
+* 従属節数は構文深度をより直接的に反映
+* 文数は補助指標
+
+3. Semantic Ambiguity（A）
+
+定義
+
+正解選択肢と誤答選択肢間の embedding 距離に基づく。
+
+手順
+
+* 各選択肢の embedding を生成
+* 正解と各誤答の cosine similarity を算出
+* 平均類似度を計算
+
+```
+A = (1 / n) * sum(cosine_similarity(correct, distractor_i))
+```
+
+解釈
+
+* 類似度が高いほど紛らわしい
+* 値はすでに 0〜1 範囲
+* 正規化不要
+
+理論的意義
+
+Semantic距離が近いほど判別困難性が増す。
+これは識別難易度の直接的代理指標である。
+
+4. Reasoning Depth（R）
+
+定義
+
+問題解決に必要な推論ステップ数。
+
+推定方法
+
+* LLMに構造抽出のみ依頼（生成評価ではない）
+* 「最小推論段階数」を出力させる
+* 数値を正規化
+
+```
+R = Steps_norm
+```
+
+理論的意義
+
+多段階推論は処理負荷増加と相関する。
+
+##### 最終難易度スコア
+
+```
+Difficulty = 0.20L + 0.20S + 0.40A + 0.20R
+```
+
+重みの理論根拠
+
+なぜ Semantic Ambiguity を 0.40 とするか
+
+本プロジェクトの中心思想は：
+
+* LLM生成を制御可能にすること
+
+Semantic Ambiguity は：
+
+* ベクトルDBを活用
+* 数学的に再現可能
+* 本プロジェクトの差別化要素
+
+そのため最も重い重みを与える。
+
+なぜ他は 0.20 か
+
+Lexical / Structural / Reasoning は：
+
+* 認知負荷の異なる側面を測定
+* 相互相関が存在する可能性がある
+* 単独で支配的ではない
+
+よって均等重みとする。
+
+スコア特性
+
+* 出力範囲：0〜1
+* 0に近い → 易しい
+* 1に近い → 難しい
+* 再現可能
+* LLM非依存
+* 拡張可能性
+
+将来的に：
+
+* IRTパラメータ統合
+* 実ユーザー正答率統合
+* 動的重み最適化
+
+が可能。
+
+現段階では理論駆動型 difficulty model として実装する。
+
+ここまでがREADME定義。
+
 #### ③ Session Drift Detection（体験ドリフト）
 
 セッション単位で：
