@@ -119,11 +119,11 @@ X_norm = (X - X_min) / (X_max - X_min)
 
 これにより difficultyScore は常に 0〜1 に収束する。
 
-##### 各構成要素の定義
+##### 各構成要素の理論整理
 
 1. Lexical Complexity（L）
 
-構成要素
+定義
 
 * 単語数（word_count）
 * 平均単語長（avg_word_length）
@@ -139,14 +139,14 @@ X_norm = (X - X_min) / (X_max - X_min)
 L = 0.5 * WC_norm + 0.5 * AWL_norm
 ```
 
-均等重みとする理由：
+均等重みの理由
 
-* 両者は同じ lexical complexity 軸に属する
+* 同一の lexical axis に属する
 * 相関はあるが完全一致しないため分離
 
 2. Structural Complexity（S）
 
-構成要素
+定義
 
 * 文の数（sentence_count）
 * 接続詞数（conjunction_count）
@@ -162,7 +162,7 @@ L = 0.5 * WC_norm + 0.5 * AWL_norm
 S = 0.6 * Clause_norm + 0.4 * Sentence_norm
 ```
 
-理由：
+重みの理由
 
 * 従属節数は構文深度をより直接的に反映
 * 文数は補助指標
@@ -221,10 +221,6 @@ R = min(steps / maxSteps, 1)
 
 * 初期値は試験問題の設計想定レンジに合わせて `maxSteps = 5` とする
 * 実データの分布に応じて将来的に更新可能
-
-```
-R = Steps_norm
-```
 
 理論的意義
 
