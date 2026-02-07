@@ -5,6 +5,10 @@ import {
   type EmbeddingProvider,
 } from "./providers/embedding.provider.js";
 import { normalizeReasoningDepth } from "./services/reasoning-depth.service.js";
+import {
+  computeLexicalComplexity,
+  computeStructuralComplexity,
+} from "./services/lexical-structural.service.js";
 
 const app = express();
 app.use(express.json());
@@ -80,6 +84,23 @@ app.post("/difficulty/reasoning-depth", (req, res) => {
 
     const score = normalizeReasoningDepth(steps, maxSteps ?? 5);
     return res.json({ R: score });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post("/difficulty/lexical-structural", (req, res) => {
+  try {
+    const { text } = req.body as { text: string };
+    if (typeof text !== "string") {
+      return res.status(400).json({ error: "Expected { text: string }" });
+    }
+
+    const lexical = computeLexicalComplexity(text);
+    const structural = computeStructuralComplexity(text);
+
+    return res.json({ lexical, structural });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return res.status(400).json({ error: message });
