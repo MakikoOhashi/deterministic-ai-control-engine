@@ -12,13 +12,6 @@ export interface DifficultyWeights {
   wR: number;
 }
 
-export const DEFAULT_WEIGHTS: DifficultyWeights = {
-  wL: 0.2,
-  wS: 0.2,
-  wA: 0.3,
-  wR: 0.3,
-};
-
 function clamp01(value: number): number {
   if (!Number.isFinite(value)) {
     throw new Error("Component values must be finite numbers.");
@@ -28,7 +21,7 @@ function clamp01(value: number): number {
 
 export function computeDifficultyScore(
   components: DifficultyComponents,
-  weights: DifficultyWeights = DEFAULT_WEIGHTS
+  weights: DifficultyWeights
 ): { D: number; components: DifficultyComponents; weights: DifficultyWeights } {
   const L = clamp01(components.L);
   const S = clamp01(components.S);

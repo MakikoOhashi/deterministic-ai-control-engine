@@ -11,8 +11,8 @@ import {
 } from "./services/lexical-structural.service.js";
 import {
   computeDifficultyScore,
-  DEFAULT_WEIGHTS,
 } from "./services/difficulty-score.service.js";
+import { DIFFICULTY_WEIGHTS } from "./config/difficulty.config.js";
 
 const app = express();
 app.use(express.json());
@@ -155,7 +155,7 @@ app.post("/difficulty/overall", (req, res) => {
 
     const score = computeDifficultyScore(
       { L: lexical.L, S: structural.S, A, R },
-      weights ?? DEFAULT_WEIGHTS
+      weights ?? DIFFICULTY_WEIGHTS
     );
 
     return res.json({
