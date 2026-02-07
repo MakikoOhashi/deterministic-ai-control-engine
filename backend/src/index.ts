@@ -9,6 +9,10 @@ import {
   computeLexicalComplexity,
   computeStructuralComplexity,
 } from "./services/lexical-structural.service.js";
+import {
+  computeDifficultyScore,
+  DEFAULT_WEIGHTS,
+} from "./services/difficulty-score.service.js";
 
 const app = express();
 app.use(express.json());
@@ -101,6 +105,65 @@ app.post("/difficulty/lexical-structural", (req, res) => {
     const structural = computeStructuralComplexity(text);
 
     return res.json({ lexical, structural });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post("/difficulty/overall", (req, res) => {
+  try {
+    const {
+      text,
+      correct,
+      distractors,
+      steps,
+      maxSteps,
+      weights,
+    } = req.body as {
+      text?: string;
+      correct?: string;
+      distractors?: string[];
+      steps?: number;
+      maxSteps?: number;
+      weights?: {
+        wL: number;
+        wS: number;
+        wA: number;
+        wR: number;
+      };
+    };
+
+    if (typeof text !== "string") {
+      return res.status(400).json({ error: "Expected { text: string, correct: string, distractors: string[], steps: number }" });
+    }
+    if (typeof correct !== "string" || !Array.isArray(distractors)) {
+      return res.status(400).json({ error: "Expected { text: string, correct: string, distractors: string[], steps: number }" });
+    }
+    if (typeof steps !== "number") {
+      return res.status(400).json({ error: "Expected { text: string, correct: string, distractors: string[], steps: number }" });
+    }
+
+    const dim = 8;
+    const correctVec = embeddingProvider.embedText(correct, dim);
+    const distractorVecs = embeddingProvider.embedTexts(distractors, dim);
+
+    const lexical = computeLexicalComplexity(text);
+    const structural = computeStructuralComplexity(text);
+    const A = semanticAmbiguityA(correctVec, distractorVecs);
+    const R = normalizeReasoningDepth(steps, maxSteps ?? 5);
+
+    const score = computeDifficultyScore(
+      { L: lexical.L, S: structural.S, A, R },
+      weights ?? DEFAULT_WEIGHTS
+    );
+
+    return res.json({
+      D: score.D,
+      components: score.components,
+      weights: score.weights,
+      details: { lexical, structural },
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return res.status(400).json({ error: message });

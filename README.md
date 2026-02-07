@@ -231,26 +231,26 @@ R = min(steps / maxSteps, 1)
 ##### 最終難易度スコア
 
 ```
-Difficulty = 0.20L + 0.20S + 0.40A + 0.20R
+Difficulty = 0.20L + 0.20S + 0.30A + 0.30R
 ```
 
 重みの理論根拠
 
-なぜ Semantic Ambiguity を 0.40 とするか
+なぜ A/R を 0.30 とするか
 
 本プロジェクトの中心思想は：
 
 * LLM生成を制御可能にすること
 
-Semantic Ambiguity は：
+Semantic Ambiguity / Reasoning Depth は：
 
 * ベクトルDBを活用
 * 数学的に再現可能
 * 本プロジェクトの差別化要素
 
-そのため最も重い重みを与える。
+そのため難易度の中核として最も重い重みを与える。
 
-なぜ他は 0.20 か
+なぜ L/S は 0.20 か
 
 Lexical / Structural / Reasoning は：
 
@@ -259,6 +259,8 @@ Lexical / Structural / Reasoning は：
 * 単独で支配的ではない
 
 よって均等重みとする。
+
+将来的に、ユーザー正答率やIRTパラメータに基づき重みを学習的に最適化する。
 
 スコア特性
 
