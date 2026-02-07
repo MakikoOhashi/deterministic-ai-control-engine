@@ -4,6 +4,7 @@ import {
   DummyEmbeddingProvider,
   type EmbeddingProvider,
 } from "./providers/embedding.provider.js";
+import { normalizeReasoningDepth } from "./services/reasoning-depth.service.js";
 
 const app = express();
 app.use(express.json());
@@ -60,6 +61,25 @@ app.post("/difficulty/semantic-ambiguity/text", (req, res) => {
     }
 
     return res.json({ A: score });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post("/difficulty/reasoning-depth", (req, res) => {
+  try {
+    const { steps, maxSteps } = req.body as {
+      steps: number;
+      maxSteps?: number;
+    };
+
+    if (typeof steps !== "number") {
+      return res.status(400).json({ error: "Expected { steps: number, maxSteps?: number }" });
+    }
+
+    const score = normalizeReasoningDepth(steps, maxSteps ?? 5);
+    return res.json({ R: score });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return res.status(400).json({ error: message });
