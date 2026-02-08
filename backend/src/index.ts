@@ -23,6 +23,10 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
+app.get("/difficulty/weights", (_req, res) => {
+  res.json({ weights: DIFFICULTY_WEIGHTS });
+});
+
 app.post("/difficulty/semantic-ambiguity", (req, res) => {
   try {
     const { correct, distractors } = req.body as {
