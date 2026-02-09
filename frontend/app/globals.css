@@ -95,6 +95,10 @@ textarea {
   align-items: center;
 }
 
+.actions button {
+  min-width: 180px;
+}
+
 button {
   background: #0f172a;
   color: #ffffff;
@@ -591,4 +595,95 @@ button:disabled {
 .quality .tab.active {
   background: linear-gradient(135deg, #43e6a4, #5aa9ff);
   color: #0b1016;
+}
+
+.quality-console {
+  color: #e8ecf3;
+}
+
+.quality-console .product-block {
+  display: grid;
+  gap: 16px;
+  padding: 12px 0 16px;
+}
+
+.quality-console .field label {
+  color: #9aa7b8;
+}
+
+.quality-console .generated {
+  border-top: 1px dashed rgba(255, 255, 255, 0.15);
+  padding-top: 12px;
+}
+
+.quality-console .generated-title {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #9aa7b8;
+  margin-bottom: 6px;
+}
+
+.quality-console .generated-text {
+  font-size: 15px;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+
+.quality-fold {
+  margin-top: 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  padding-top: 12px;
+}
+
+.quality-fold summary {
+  cursor: pointer;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #9aa7b8;
+  margin-bottom: 10px;
+}
+
+.quality-console .audit-block {
+  display: grid;
+  gap: 12px;
+}
+
+.summary.compact {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.table.compact .row {
+  grid-template-columns: 0.5fr 1fr 1fr 1fr 1.2fr;
+}
+
+.quality-console .hint {
+  font-size: 14px;
+  color: #e8ecf3;
+}
+
+.compliance-badge {
+  font-size: 20px;
+  font-weight: 700;
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  display: inline-block;
+  margin-bottom: 10px;
+}
+
+.compliance-badge.within {
+  color: var(--good);
+  border-color: #d1fae5;
+}
+
+.compliance-badge.minor {
+  color: var(--warn);
+  border-color: #fde68a;
+}
+
+.compliance-badge.out {
+  color: var(--bad);
+  border-color: #fecaca;
 }
