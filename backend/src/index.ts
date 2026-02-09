@@ -22,6 +22,7 @@ import { targetFromStructure } from "./services/structure-target.service.js";
 import { classifyFormat } from "./services/format-classifier.service.js";
 import { validateGenerated } from "./services/format-validator.service.js";
 import { cosineSimilarity } from "./utils/cosine.js";
+import { GeminiTextGenerationProvider } from "./providers/gemini.generate.provider.js";
 
 const app = express();
 app.use(express.json());
@@ -46,6 +47,13 @@ const embeddingProvider: EmbeddingProvider = (() => {
     return new GeminiEmbeddingProvider(apiKey, model);
   }
   return new DummyEmbeddingProvider();
+})();
+
+const generationProvider = (() => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  const model = process.env.GEMINI_GENERATION_MODEL || "gemini-2.5-flash";
+  return new GeminiTextGenerationProvider(apiKey, model);
 })();
 
 app.get("/health", (_req, res) => {
@@ -244,7 +252,8 @@ app.post("/generate/fill-blank", async (req, res) => {
       return res.json({ item: valid || candidates[0], candidates, format });
     }
     const scored = [];
-    const sourceVec = await embeddingProvider.embedText(normalizeForSimilarity(sourceText), 8);
+    const normalizedSource = normalizeForSimilarity(sourceText);
+    const sourceVec = await embeddingProvider.embedText(normalizedSource, 8);
     for (const c of candidates) {
       const lexical = computeLexicalComplexity(c.text);
       const structural = computeStructuralComplexity(c.text);
@@ -257,20 +266,24 @@ app.post("/generate/fill-blank", async (req, res) => {
         (structural.S - target.S) ** 2 +
         (A - target.A) ** 2 +
         (R - target.R) ** 2;
-      const candidateVec = await embeddingProvider.embedText(normalizeForSimilarity(c.text), 8);
+      const normalizedCandidate = normalizeForSimilarity(c.text);
+      const candidateVec = await embeddingProvider.embedText(normalizedCandidate, 8);
       const similarity = cosineSimilarity(sourceVec, candidateVec);
-      scored.push({ item: c, distance: Math.sqrt(d), similarity });
+      const jaccard = tokenJaccard(normalizedSource, normalizedCandidate);
+      scored.push({ item: c, distance: Math.sqrt(d), similarity, jaccard });
     }
     scored.sort((a, b) => a.distance - b.distance);
     const MIN_SIM = 0.4;
     const MAX_SIM = 0.85;
+    const MAX_JACCARD = 0.75;
     let attempts = 0;
     let best =
       scored.find(
         (s) =>
           validateGenerated(s.item.text, format).ok &&
           s.similarity >= MIN_SIM &&
-          s.similarity <= MAX_SIM
+          s.similarity <= MAX_SIM &&
+          s.jaccard <= MAX_JACCARD
       ) || null;
 
     while (!best && attempts < 2) {
@@ -280,18 +293,18 @@ app.post("/generate/fill-blank", async (req, res) => {
         item: { ...s.item, text: softenSimilarity(s.item.text) },
       }));
       for (const s of softened) {
-        const softenedVec = await embeddingProvider.embedText(
-          normalizeForSimilarity(s.item.text),
-          8
-        );
+        const normalizedCandidate = normalizeForSimilarity(s.item.text);
+        const softenedVec = await embeddingProvider.embedText(normalizedCandidate, 8);
         s.similarity = cosineSimilarity(sourceVec, softenedVec);
+        s.jaccard = tokenJaccard(normalizedSource, normalizedCandidate);
       }
       best =
         softened.find(
           (s) =>
             validateGenerated(s.item.text, format).ok &&
             s.similarity >= MIN_SIM &&
-            s.similarity <= MAX_SIM
+            s.similarity <= MAX_SIM &&
+            s.jaccard <= MAX_JACCARD
         ) || null;
       if (best) {
         return res.json({
@@ -299,14 +312,48 @@ app.post("/generate/fill-blank", async (req, res) => {
           candidates: scored,
           format,
           similarity: best.similarity,
-          similarityRange: { min: MIN_SIM, max: MAX_SIM },
+          jaccard: best.jaccard,
+          similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
         });
+      }
+    }
+
+    if (generationProvider) {
+      const base = candidates[0];
+      const system =
+        "You are a question rewriter. Output only one sentence. Do not add options or extra text.";
+      const prompt = [
+        "Rewrite the sentence while keeping the exact blank marker pattern.",
+        "Keep the missing word the same.",
+        `Format: ${format}`,
+        `Blanked template: ${base.text}`,
+        `Missing word: ${base.correct}`,
+        `Original example: ${sourceText}`,
+      ].join("\n");
+      const rewritten = await generationProvider.generateText(prompt, system);
+      if (validateGenerated(rewritten, format).ok) {
+        const candidateVec = await embeddingProvider.embedText(
+          normalizeForSimilarity(rewritten),
+          8
+        );
+        const sim = cosineSimilarity(sourceVec, candidateVec);
+        const jaccard = tokenJaccard(normalizedSource, normalizeForSimilarity(rewritten));
+        if (sim >= MIN_SIM && sim <= MAX_SIM && jaccard <= MAX_JACCARD) {
+          return res.json({
+            item: { ...base, text: rewritten },
+            candidates: scored,
+            format,
+            similarity: sim,
+            jaccard,
+            similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+          });
+        }
       }
     }
 
     return res.status(422).json({
       error: "Generated problem too similar to source. Please try again.",
-      similarityRange: { min: MIN_SIM, max: MAX_SIM },
+      similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -375,4 +422,15 @@ function softenSimilarity(text: string): string {
     out = `In this statement, ${text.charAt(0).toLowerCase()}${text.slice(1)}`;
   }
   return out;
+}
+
+function tokenJaccard(a: string, b: string): number {
+  const tokensA = new Set(a.split(/\s+/).filter(Boolean));
+  const tokensB = new Set(b.split(/\s+/).filter(Boolean));
+  const union = new Set([...tokensA, ...tokensB]);
+  let inter = 0;
+  for (const t of tokensA) {
+    if (tokensB.has(t)) inter += 1;
+  }
+  return union.size === 0 ? 0 : inter / union.size;
 }

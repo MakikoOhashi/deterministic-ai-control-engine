@@ -112,15 +112,23 @@ export default function Home() {
       setTarget(data.mean);
       setTargetStability(data.stability);
       setEffectiveTolerance(data.effectiveTolerance);
+      return data.mean;
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
+      setText("");
+      setCorrect("");
+      setDistractors([]);
+      setFormat(null);
+      setSelected(null);
+      setBlankAnswer("");
+      return null;
     } finally {
       setLoading(false);
     }
   };
 
-  const handleGenerate = async () => {
+  const handleGenerate = async (targetOverride?: Components | null) => {
     setLoading(true);
     setError(null);
     try {
@@ -133,7 +141,7 @@ export default function Home() {
       const res = await fetch(`${apiBase}/generate/fill-blank`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sourceText, target }),
+        body: JSON.stringify({ sourceText, target: targetOverride ?? target }),
       });
       if (!res.ok) {
         const err = await res.json();
@@ -155,14 +163,20 @@ export default function Home() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
+      setText("");
+      setCorrect("");
+      setDistractors([]);
+      setFormat(null);
+      setSelected(null);
+      setBlankAnswer("");
     } finally {
       setLoading(false);
     }
   };
 
   const handleSetAndGenerate = async () => {
-    await handleSetTarget();
-    await handleGenerate();
+    const nextTarget = await handleSetTarget();
+    await handleGenerate(nextTarget);
   };
 
   const handleAudit = async () => {
