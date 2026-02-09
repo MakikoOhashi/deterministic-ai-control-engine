@@ -15,6 +15,8 @@ import {
 import { DIFFICULTY_WEIGHTS } from "./config/difficulty.config.js";
 import { BASELINE_ITEMS } from "./config/baseline.items.js";
 import { computeTargetProfile } from "./services/target-profile.service.js";
+import { generateFillBlank, generateFillBlankCandidates } from "./services/fill-blank.service.js";
+import { computeTargetFromSources } from "./services/target-from-sources.service.js";
 
 const app = express();
 app.use(express.json());
@@ -201,6 +203,55 @@ app.post("/difficulty/overall", (req, res) => {
       weights: score.weights,
       details: { lexical, structural },
     });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post("/generate/fill-blank", (req, res) => {
+  try {
+    const { sourceText, target } = req.body as {
+      sourceText: string;
+      target?: { L: number; S: number; A: number; R: number };
+    };
+    if (typeof sourceText !== "string") {
+      return res.status(400).json({ error: "Expected { sourceText: string }" });
+    }
+    const candidates = generateFillBlankCandidates(sourceText);
+    if (!target) {
+      return res.json({ item: candidates[0], candidates });
+    }
+    const scored = candidates.map((c) => {
+      const lexical = computeLexicalComplexity(c.text);
+      const structural = computeStructuralComplexity(c.text);
+      const correctVec = embeddingProvider.embedText(c.correct, 8);
+      const distractorVecs = embeddingProvider.embedTexts(c.distractors, 8);
+      const A = semanticAmbiguityA(correctVec, distractorVecs);
+      const R = normalizeReasoningDepth(c.steps, 5);
+      const d =
+        (lexical.L - target.L) ** 2 +
+        (structural.S - target.S) ** 2 +
+        (A - target.A) ** 2 +
+        (R - target.R) ** 2;
+      return { item: c, distance: Math.sqrt(d) };
+    });
+    scored.sort((a, b) => a.distance - b.distance);
+    return res.json({ item: scored[0].item, candidates: scored });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post("/target/from-sources", (req, res) => {
+  try {
+    const { sourceTexts } = req.body as { sourceTexts: string[] };
+    if (!Array.isArray(sourceTexts)) {
+      return res.status(400).json({ error: "Expected { sourceTexts: string[] }" });
+    }
+    const stats = computeTargetFromSources(sourceTexts, embeddingProvider, 5);
+    return res.json(stats);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
     return res.status(400).json({ error: message });

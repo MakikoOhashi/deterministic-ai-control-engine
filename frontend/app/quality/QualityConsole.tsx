@@ -76,9 +76,9 @@ function distanceScore(current: Components, target: Components, weights: Weights
   return Math.sqrt(sum);
 }
 
-function distanceCompliance(distanceValue: number) {
-  if (distanceValue <= 0.05) return "within";
-  if (distanceValue <= 0.15) return "minor";
+function distanceCompliance(distanceValue: number, tol: number) {
+  if (distanceValue <= tol) return "within";
+  if (distanceValue <= tol * 3) return "minor";
   return "out";
 }
 
@@ -141,6 +141,12 @@ function RadarChart({ data }: { data: Components }) {
 }
 
 export default function QualityConsole() {
+  const [baselineSources, setBaselineSources] = useState(
+    "Yesterday, we went to the park, and it brought back so many childhood memories."
+  );
+  const [sourceText, setSourceText] = useState(
+    "Yesterday, we went to the park, and it brought back so many childhood memories."
+  );
   const [text, setText] = useState(
     "Although it is improving, the author implies climate change is accelerating rapidly, and policy is involved."
   );
@@ -155,6 +161,9 @@ export default function QualityConsole() {
   const [steps, setSteps] = useState(3);
   const [weights, setWeights] = useState<Weights | null>(null);
   const [target, setTarget] = useState<Components | null>(null);
+  const [targetStd, setTargetStd] = useState<Components | null>(null);
+  const [targetStability, setTargetStability] = useState<string | null>(null);
+  const [effectiveTolerance, setEffectiveTolerance] = useState<number>(0.05);
   const [baselineCount, setBaselineCount] = useState<number | null>(null);
   const [baselineItem, setBaselineItem] = useState<BaselineItem | null>(null);
   const [result, setResult] = useState<OverallResponse | null>(null);
@@ -223,6 +232,34 @@ export default function QualityConsole() {
     }
   };
 
+  const handleGenerate = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${apiBase}/generate/fill-blank`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sourceText, target }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Request failed");
+      }
+      const data = (await res.json()) as {
+        item: { text: string; correct: string; distractors: string[]; steps: number };
+      };
+      setText(data.item.text);
+      setCorrect(data.item.correct);
+      setDistractors(data.item.distractors.join("\n"));
+      setSteps(data.item.steps);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const current = result?.components || { L: 0, S: 0, A: 0, R: 0 };
   const targetProfile = target || { L: 0, S: 0, A: 0, R: 0 };
   const deltas = {
@@ -246,7 +283,7 @@ export default function QualityConsole() {
   const RCompliance = result ? complianceLevel(deltas.R) : "within";
   const effectiveWeights = weights || { wL: 0.2, wS: 0.2, wA: 0.3, wR: 0.3 };
   const distance = result && target ? distanceScore(current, targetProfile, effectiveWeights) : 0;
-  const distanceStatus = result ? distanceCompliance(distance) : "within";
+  const distanceStatus = result ? distanceCompliance(distance, effectiveTolerance) : "within";
 
   const suggestions = [
     deltas.L < -0.05 ? "Increase lexical complexity (use longer or rarer words)." : null,
@@ -304,6 +341,66 @@ export default function QualityConsole() {
       <div className="grid">
         <div className="panel">
           <h2>Input</h2>
+          <label>Baseline Sources (1-3, separated by blank lines)</label>
+          <textarea
+            value={baselineSources}
+            onChange={(e) => setBaselineSources(e.target.value)}
+          />
+          <div className="actions">
+            <button
+              onClick={async () => {
+                setLoading(true);
+                setError(null);
+                try {
+                  const sourceTexts = baselineSources
+                    .split(/\n\s*\n/)
+                    .map((s) => s.trim())
+                    .filter(Boolean)
+                    .slice(0, 3);
+                  const res = await fetch(`${apiBase}/target/from-sources`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ sourceTexts }),
+                  });
+                  if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.error || "Request failed");
+                  }
+                  const data = (await res.json()) as {
+                    mean: Components;
+                    std: Components;
+                    count: number;
+                    stability: string;
+                    effectiveTolerance: number;
+                  };
+                  setTarget(data.mean);
+                  setTargetStd(data.std);
+                  setTargetStability(data.stability);
+                  setEffectiveTolerance(data.effectiveTolerance);
+                } catch (err) {
+                  const message = err instanceof Error ? err.message : "Unknown error";
+                  setError(message);
+                } finally {
+                  setLoading(false);
+                }
+              }}
+              disabled={loading}
+            >
+              {loading ? "Calculating..." : "Set Target from Sources"}
+            </button>
+          </div>
+
+          <label>Source Text (for auto generation)</label>
+          <textarea
+            value={sourceText}
+            onChange={(e) => setSourceText(e.target.value)}
+          />
+          <div className="actions">
+            <button onClick={handleGenerate} disabled={loading}>
+              {loading ? "Generating..." : "Generate Fill-in"}
+            </button>
+          </div>
+
           <label>Problem Text</label>
           <textarea value={text} onChange={(e) => setText(e.target.value)} />
 
@@ -346,7 +443,10 @@ export default function QualityConsole() {
             <div className={`summary-card ${result ? distanceStatus : ""}`}>
               <div className="label">Compliance</div>
               <div className="value">{result ? complianceLabel(distanceStatus) : "--"}</div>
-              <div className="meta">Distance thresholds: ≤0.05 / 0.15</div>
+              <div className="meta">
+                Distance thresholds: ≤{effectiveTolerance.toFixed(2)} /{" "}
+                {(effectiveTolerance * 3).toFixed(2)}
+              </div>
             </div>
             <div className="summary-card">
               <div className="label">Target D</div>
@@ -425,6 +525,15 @@ export default function QualityConsole() {
               <div>S: {target ? target.S.toFixed(2) : "--"}</div>
               <div>A: {target ? target.A.toFixed(2) : "--"}</div>
               <div>R: {target ? target.R.toFixed(2) : "--"}</div>
+            </div>
+            <div className="weights" style={{ marginTop: 8 }}>
+              <div>σL: {targetStd ? targetStd.L.toFixed(2) : "--"}</div>
+              <div>σS: {targetStd ? targetStd.S.toFixed(2) : "--"}</div>
+              <div>σA: {targetStd ? targetStd.A.toFixed(2) : "--"}</div>
+              <div>σR: {targetStd ? targetStd.R.toFixed(2) : "--"}</div>
+            </div>
+            <div className="muted" style={{ marginTop: 6 }}>
+              Stability: {targetStability || "--"} (n={baselineSources.split(/\n\s*\n/).filter(Boolean).slice(0, 3).length})
             </div>
           </div>
 
