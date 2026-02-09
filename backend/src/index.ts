@@ -13,9 +13,20 @@ import {
   computeDifficultyScore,
 } from "./services/difficulty-score.service.js";
 import { DIFFICULTY_WEIGHTS } from "./config/difficulty.config.js";
+import { BASELINE_ITEMS } from "./config/baseline.items.js";
+import { computeTargetProfile } from "./services/target-profile.service.js";
 
 const app = express();
 app.use(express.json());
+app.use((_req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  if (_req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+  return next();
+});
 
 const embeddingProvider: EmbeddingProvider = new DummyEmbeddingProvider();
 
@@ -25,6 +36,28 @@ app.get("/health", (_req, res) => {
 
 app.get("/difficulty/weights", (_req, res) => {
   res.json({ weights: DIFFICULTY_WEIGHTS });
+});
+
+app.get("/config/target-profile", (_req, res) => {
+  try {
+    const target = computeTargetProfile(BASELINE_ITEMS, embeddingProvider, 5);
+    res.json({
+      target,
+      baselineCount: BASELINE_ITEMS.length,
+      note:
+        "Target profile derived from internally constructed baseline items (non-proprietary).",
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    res.status(400).json({ error: message });
+  }
+});
+
+app.get("/config/baseline-sample", (_req, res) => {
+  if (BASELINE_ITEMS.length === 0) {
+    return res.status(404).json({ error: "No baseline items configured." });
+  }
+  return res.json({ item: BASELINE_ITEMS[0], baselineCount: BASELINE_ITEMS.length });
 });
 
 app.post("/difficulty/semantic-ambiguity", (req, res) => {

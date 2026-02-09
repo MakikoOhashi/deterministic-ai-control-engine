@@ -283,6 +283,18 @@ Lexical / Structural / Reasoning は：
 
 ここまでがREADME定義。
 
+##### Target Profile（観測ベースライン）
+
+Target profile is derived from internally constructed baseline assessment items (non-proprietary).
+Each baseline item is evaluated to produce (L, S, A, R), and the target is the mean vector across items:
+
+```
+T = (1 / N) * sum(v_i), where v_i = (L_i, S_i, A_i, R_i)
+```
+
+This target is configurable and not tied to proprietary data.
+将来的に学習データに基づいて更新可能とする。
+
 #### ③ Session Drift Detection（体験ドリフト）
 
 セッション単位で：
