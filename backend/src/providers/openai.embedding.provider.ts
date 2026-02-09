@@ -14,11 +14,11 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.model = options.model;
   }
 
-  embedText(_text: string, _dimension = 8): number[] {
+  async embedText(_text: string, _dimension = 8): Promise<number[]> {
     throw new Error("OpenAIEmbeddingProvider.embedText is not implemented.");
   }
 
-  embedTexts(_texts: string[], _dimension = 8): number[][] {
+  async embedTexts(_texts: string[], _dimension = 8): Promise<number[][]> {
     throw new Error("OpenAIEmbeddingProvider.embedTexts is not implemented.");
   }
 }

@@ -11,7 +11,7 @@ export interface TargetProfile {
   R: number;
 }
 
-export function computeTargetProfile(
+export async function computeTargetProfile(
   items: BaselineItem[],
   provider: EmbeddingProvider,
   maxSteps = 5
@@ -28,8 +28,8 @@ export function computeTargetProfile(
   for (const item of items) {
     const lexical = computeLexicalComplexity(item.text);
     const structural = computeStructuralComplexity(item.text);
-    const correctVec = provider.embedText(item.correct, 8);
-    const distractorVecs = provider.embedTexts(item.distractors, 8);
+    const correctVec = await provider.embedText(item.correct, 8);
+    const distractorVecs = await provider.embedTexts(item.distractors, 8);
     const A = semanticAmbiguityA(correctVec, distractorVecs);
     const R = normalizeReasoningDepth(item.steps, maxSteps);
 

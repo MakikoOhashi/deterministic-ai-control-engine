@@ -52,6 +52,8 @@ export default function Home() {
   const [text, setText] = useState("");
   const [correct, setCorrect] = useState("");
   const [distractors, setDistractors] = useState<string[]>([]);
+  const [format, setFormat] = useState<string | null>(null);
+  const [blankAnswer, setBlankAnswer] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
 
@@ -62,6 +64,7 @@ export default function Home() {
   const [result, setResult] = useState<OverallResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [similarity, setSimilarity] = useState<number | null>(null);
 
   useEffect(() => {
     fetch(`${apiBase}/difficulty/weights`)
@@ -86,15 +89,16 @@ export default function Home() {
     setLoading(true);
     setError(null);
     try {
-      const sourceTexts = baselineSources
-        .split(/\n\s*\n/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .slice(0, 3);
       const res = await fetch(`${apiBase}/target/from-sources`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sourceTexts }),
+        body: JSON.stringify({
+          sourceTexts: baselineSources
+            .split(/\n\s*\n/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .slice(0, 3),
+        }),
       });
       if (!res.ok) {
         const err = await res.json();
@@ -102,7 +106,6 @@ export default function Home() {
       }
       const data = (await res.json()) as {
         mean: Components;
-        count: number;
         stability: string;
         effectiveTolerance: number;
       };
@@ -138,11 +141,16 @@ export default function Home() {
       }
       const data = (await res.json()) as {
         item: { text: string; correct: string; distractors: string[]; steps: number };
+        format?: string;
+        similarity?: number;
       };
       setText(data.item.text);
       setCorrect(data.item.correct);
       setDistractors(shuffle(data.item.distractors));
+      setFormat(data.format || null);
+      setSimilarity(typeof data.similarity === "number" ? data.similarity : null);
       setSelected(null);
+      setBlankAnswer("");
       setSubmitted(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -186,6 +194,18 @@ export default function Home() {
   };
 
   const isCorrect = submitted && selected === correct;
+  const hasBlank = format === "full_blank" || format === "prefix_blank" || /(_\s*){2,}/.test(text);
+  const prefixMatch = text.match(/([A-Za-z]+)\s*((?:_\s*){2,})/);
+  const prefix = prefixMatch ? prefixMatch[1] : "";
+  const blankCount = prefixMatch ? (prefixMatch[2].match(/_/g) || []).length : 0;
+  const isPrefixBlank = format === "prefix_blank" || (!!prefixMatch && blankCount > 0);
+  const userAnswer = (hasBlank ? blankAnswer : selected || "").trim().toLowerCase();
+  const correctLower = correct.toLowerCase();
+  const suffix = prefix ? correctLower.slice(prefix.length) : "";
+  const blankCorrect =
+    submitted &&
+    (userAnswer === correctLower ||
+      (isPrefixBlank && userAnswer === suffix && suffix.length === blankCount));
 
   const hints = [
     target && result
@@ -227,37 +247,57 @@ export default function Home() {
           </button>
         </div>
 
-        <div className="generated">
-          <div className="generated-title">Generated Question</div>
-          <div className="generated-text">{text || "—"}</div>
-          <div className="options">
-            {[correct, ...distractors].filter(Boolean).map((opt) => (
-              <label key={opt} className="option">
-                <input
-                  type="radio"
-                  name="answer"
-                  value={opt}
-                  checked={selected === opt}
-                  onChange={() => setSelected(opt)}
-                />
-                <span>{opt}</span>
-              </label>
-            ))}
-          </div>
-          <div className="actions">
-            <button onClick={() => setSubmitted(true)} disabled={!selected}>
-              Submit Answer
-            </button>
-            <button onClick={handleAudit} disabled={loading}>
-              {loading ? "Auditing..." : "Run Audit"}
-            </button>
-          </div>
-          {submitted ? (
-            <div className={isCorrect ? "result good" : "result bad"}>
-              {isCorrect ? "Correct" : `Correct answer: ${correct}`}
+            <div className="generated">
+              <div className="generated-title">Generated Question</div>
+              <div className="generated-text">{text || "—"}</div>
+              {hasBlank ? (
+                <div className="field" style={{ marginTop: 12 }}>
+                  <label>{isPrefixBlank ? "Type the missing letters" : "Type the missing word"}</label>
+                  <input
+                    value={blankAnswer}
+                    onChange={(e) => setBlankAnswer(e.target.value)}
+                    placeholder="Your answer"
+                  />
+                </div>
+              ) : (
+                <div className="options">
+                  {[correct, ...distractors].filter(Boolean).map((opt) => (
+                    <label key={opt} className="option">
+                      <input
+                        type="radio"
+                        name="answer"
+                        value={opt}
+                        checked={selected === opt}
+                        onChange={() => setSelected(opt)}
+                      />
+                      <span>{opt}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <div className="actions">
+                <button
+                  onClick={() => setSubmitted(true)}
+                  disabled={hasBlank ? !blankAnswer : !selected}
+                >
+                  Submit Answer
+                </button>
+                <button onClick={handleAudit} disabled={loading}>
+                  {loading ? "Auditing..." : "Run Audit"}
+                </button>
+              </div>
+              {submitted ? (
+                <div className={isCorrect ? "result good" : "result bad"}>
+                  {hasBlank
+                    ? blankCorrect
+                      ? "Correct"
+                      : `Correct answer: ${correct}`
+                    : isCorrect
+                    ? "Correct"
+                    : `Correct answer: ${correct}`}
+                </div>
+              ) : null}
             </div>
-          ) : null}
-        </div>
 
         {error ? <div className="error" style={{ marginTop: 12 }}>{error}</div> : null}
       </div>
@@ -268,6 +308,7 @@ export default function Home() {
         weights={weights}
         effectiveTolerance={effectiveTolerance}
         stability={targetStability}
+        similarity={similarity}
         error={error}
       />
     </main>

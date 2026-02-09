@@ -1,6 +1,6 @@
 export interface EmbeddingProvider {
-  embedText(text: string, dimension?: number): number[];
-  embedTexts(texts: string[], dimension?: number): number[][];
+  embedText(text: string, dimension?: number): Promise<number[]>;
+  embedTexts(texts: string[], dimension?: number): Promise<number[][]>;
 }
 
 function fnv1a32(input: string): number {
@@ -29,7 +29,7 @@ function normalize(vec: number[]): number[] {
 }
 
 export class DummyEmbeddingProvider implements EmbeddingProvider {
-  embedText(text: string, dimension = 8): number[] {
+  async embedText(text: string, dimension = 8): Promise<number[]> {
     const seed = fnv1a32(text.trim().toLowerCase());
     const rand = lcg(seed);
     const vec = new Array<number>(dimension);
@@ -39,8 +39,58 @@ export class DummyEmbeddingProvider implements EmbeddingProvider {
     return normalize(vec);
   }
 
-  embedTexts(texts: string[], dimension = 8): number[][] {
-    return texts.map((t) => this.embedText(t, dimension));
+  async embedTexts(texts: string[], dimension = 8): Promise<number[][]> {
+    return Promise.all(texts.map((t) => this.embedText(t, dimension)));
+  }
+}
+
+export class GeminiEmbeddingProvider implements EmbeddingProvider {
+  private apiKey: string;
+  private model: string;
+
+  constructor(apiKey: string, model: string) {
+    this.apiKey = apiKey;
+    this.model = model;
+  }
+
+  async embedText(text: string): Promise<number[]> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:embedContent?key=${this.apiKey}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        content: { parts: [{ text }] },
+      }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`Gemini embedContent failed: ${msg}`);
+    }
+    const data = (await res.json()) as { embedding?: { values: number[] } };
+    if (!data.embedding?.values) {
+      throw new Error("Gemini embedContent returned no embedding.");
+    }
+    return data.embedding.values;
+  }
+
+  async embedTexts(texts: string[]): Promise<number[][]> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:batchEmbedContents?key=${this.apiKey}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requests: texts.map((text) => ({ content: { parts: [{ text }] } })),
+      }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`Gemini batchEmbedContents failed: ${msg}`);
+    }
+    const data = (await res.json()) as { embeddings?: { values: number[] }[] };
+    if (!data.embeddings || data.embeddings.length === 0) {
+      throw new Error("Gemini batchEmbedContents returned no embeddings.");
+    }
+    return data.embeddings.map((e) => e.values);
   }
 }
 

@@ -1,4 +1,38 @@
 const WORD_REGEX = /[A-Za-z']+/g;
+const PREFIX_TOKEN_REGEX = /([A-Za-z]+)\s*((?:_\s*){2,})/;
+const COMMON_WORDS = [
+  "daily",
+  "fat",
+  "few",
+  "fuel",
+  "low",
+  "long",
+  "lost",
+  "late",
+  "last",
+  "list",
+  "line",
+  "light",
+  "local",
+  "likely",
+  "little",
+  "public",
+  "private",
+  "simple",
+  "single",
+  "strong",
+  "steady",
+  "swimming",
+  "swimmer",
+  "swim",
+  "swing",
+  "choose",
+  "change",
+  "chance",
+  "sudden",
+  "silver",
+  "silent",
+];
 
 const STOPWORDS = new Set([
   "the",
@@ -99,22 +133,80 @@ function buildDistractors(sentence: string, target: string): string[] {
   return distractors;
 }
 
+function preprocessSource(sourceText: string, preserveBlanks = false): string {
+  const lines = sourceText
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const filtered = lines.filter(
+    (l) => !/complete the sentence|choose the correct/i.test(l)
+  );
+  const joined = (filtered.length > 0 ? filtered : lines).join(" ");
+  if (preserveBlanks) return joined;
+  return joined.replace(/(_\s*){2,}/g, "");
+}
+
+export function normalizeForSimilarity(sourceText: string): string {
+  return preprocessSource(sourceText)
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 export function generateFillBlank(sourceText: string, mode: "first" | "longest" | "last" = "first"): {
   text: string;
   correct: string;
   distractors: string[];
   steps: number;
 } {
-  const sentences = splitSentences(sourceText);
+  const prefixMatch = sourceText.match(PREFIX_TOKEN_REGEX);
+  const cleaned = preprocessSource(sourceText);
+  const cleanedWithBlanks = preprocessSource(sourceText, true);
+  const sentences = splitSentences(cleaned);
   if (sentences.length === 0) {
     throw new Error("sourceText must contain at least one sentence.");
   }
   const sentence = sentences.reduce((a, b) => (a.length >= b.length ? a : b));
-  const target = pickTargetWord(sentence, mode);
+  let target = pickTargetWord(sentence, mode);
   if (!target) {
     throw new Error("No suitable target word found.");
   }
-  const blanked = sentence.replace(target, "____");
+  let blanked = sentence.replace(target, "____");
+  if (/(_\s*){2,}/.test(cleanedWithBlanks)) {
+    blanked = cleanedWithBlanks;
+  }
+
+  if (prefixMatch) {
+    const prefix = prefixMatch[1];
+    const blanks = prefixMatch[2] || "";
+    const blankCount = (blanks.match(/_/g) || []).length;
+    const desiredLen = prefix.length + blankCount;
+    const candidate = COMMON_WORDS.find(
+      (w) => w.startsWith(prefix.toLowerCase()) && w.length === desiredLen
+    );
+    if (candidate) {
+      target = candidate;
+    } else {
+      const fallback = prefix + "e".repeat(Math.max(blankCount, 1));
+      target = fallback;
+    }
+    if (prefix && blanks) {
+      blanked = cleanedWithBlanks.replace(PREFIX_TOKEN_REGEX, `${prefix}${blanks}`);
+    } else {
+      blanked = sentence.replace(target, `${prefix}${blanks}`);
+    }
+  }
+
+  const normalizedBlanked = blanked.replace(/\s+/g, " ").trim();
+  const normalizedSource = cleanedWithBlanks.replace(/\s+/g, " ").trim();
+  if (normalizedBlanked === normalizedSource) {
+    const lowered =
+      blanked.length > 0
+        ? blanked.charAt(0).toLowerCase() + blanked.slice(1)
+        : blanked;
+    blanked = `It can be difficult to ${lowered}`;
+  }
+
   const distractors = buildDistractors(sentence, target);
   const wordCount = extractWords(sentence).length;
   const steps = wordCount >= 12 ? 2 : 1;

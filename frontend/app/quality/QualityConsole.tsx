@@ -65,9 +65,10 @@ export default function QualityConsole(props: {
   weights: Weights | null;
   effectiveTolerance: number;
   stability: string | null;
+  similarity?: number | null;
   error?: string | null;
 }) {
-  const { result, target, weights, effectiveTolerance, stability, error } = props;
+  const { result, target, weights, effectiveTolerance, stability, similarity, error } = props;
 
   const current = result?.components || { L: 0, S: 0, A: 0, R: 0 };
   const targetProfile = target || { L: 0, S: 0, A: 0, R: 0 };
@@ -115,6 +116,12 @@ export default function QualityConsole(props: {
           <div className="summary-card">
             <div className="label">Stability</div>
             <div className="value">{stability || "--"}</div>
+          </div>
+          <div className="summary-card">
+            <div className="label">Similarity</div>
+            <div className="value">
+              {typeof similarity === "number" ? similarity.toFixed(3) : "--"}
+            </div>
           </div>
         </div>
 

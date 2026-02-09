@@ -35,7 +35,7 @@ function toleranceFromCount(count: number) {
   return 0.05;
 }
 
-export function computeTargetFromSources(
+export async function computeTargetFromSources(
   sourceTexts: string[],
   provider: EmbeddingProvider,
   maxSteps = 5
@@ -54,8 +54,8 @@ export function computeTargetFromSources(
     const candidate = generateFillBlankCandidates(source)[0];
     const lexical = computeLexicalComplexity(candidate.text);
     const structural = computeStructuralComplexity(candidate.text);
-    const correctVec = provider.embedText(candidate.correct, 8);
-    const distractorVecs = provider.embedTexts(candidate.distractors, 8);
+    const correctVec = await provider.embedText(candidate.correct, 8);
+    const distractorVecs = await provider.embedTexts(candidate.distractors, 8);
     const A = semanticAmbiguityA(correctVec, distractorVecs);
     const R = normalizeReasoningDepth(candidate.steps, maxSteps);
     Ls.push(lexical.L);
