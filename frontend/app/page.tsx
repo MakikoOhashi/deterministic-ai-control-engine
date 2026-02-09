@@ -59,16 +59,16 @@ export default function Home() {
 
       <div className="panel">
        
-        <div className="home-actions" style={{ marginBottom: 16 }}>
+        <div className="tabs" style={{ marginBottom: 16 }}>
           <button
+            className={`tab ${view === "try" ? "active" : ""}`}
             onClick={() => setView("try")}
-            disabled={view === "try"}
           >
             Try a Question
           </button>
           <button
+            className={`tab ${view === "quality" ? "active" : ""}`}
             onClick={() => setView("quality")}
-            disabled={view === "quality"}
           >
             View Quality Control
           </button>
@@ -80,7 +80,7 @@ export default function Home() {
               {item?.text || "Loading..."}
             </div>
 
-            <div style={{ marginTop: 16 }}>
+            <div className="options">
               {options.map((opt) => (
                 <label key={opt} className="option">
                   <input
