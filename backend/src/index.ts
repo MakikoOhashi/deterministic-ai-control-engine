@@ -505,8 +505,8 @@ app.post("/generate/mc", async (req, res) => {
     const maxSim =
       modeLabel === "B"
         ? expectedSubtype === "combo"
-          ? 0.96
-          : 0.92
+          ? 0.9
+          : 0.9
         : expectedSubtype === "combo"
         ? 0.92
         : 0.85;
@@ -602,7 +602,7 @@ app.post("/generate/mc", async (req, res) => {
       "Use the same language as the source.",
       useComboStyle
         ? modeLabel === "B"
-          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same audit topic and concept, but rephrase each statement with different wording.`
+          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same audit topic and concept, but DO NOT paraphrase line-by-line. Change structure and conditions (e.g., actor, scope, period) while staying within the same legal topic. Avoid reusing sentence order or clause structure from the source.`
           : `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Do NOT paraphrase the original statements. Replace them with different audit topics (e.g., internal control, going concern, subsequent events, materiality, audit risk). Each statement must introduce a different concept from the source.`
         : modeLabel === "B"
         ? "Match the overall style and structure of the source. Preserve the same topic and intent, but rephrase the content."
