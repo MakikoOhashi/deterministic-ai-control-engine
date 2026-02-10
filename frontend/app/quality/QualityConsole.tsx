@@ -74,6 +74,13 @@ export default function QualityConsole(props: {
     choices: number | null;
   } | null;
   choiceIntent?: { concept: string; patterns: string[] } | null;
+  choiceStructure?: {
+    correctMeanSim: number;
+    distractorMeanSim: number;
+    distractorVariance: number;
+    isolationIndex: number;
+  } | null;
+  mode?: "A" | "B";
   error?: string | null;
 }) {
   const {
@@ -85,6 +92,8 @@ export default function QualityConsole(props: {
     similarity,
     similarityBreakdown,
     choiceIntent,
+    choiceStructure,
+    mode,
     error,
   } = props;
 
@@ -179,6 +188,32 @@ export default function QualityConsole(props: {
             <div className="meta">
               {choiceIntent.patterns.join(" • ")}
             </div>
+          </div>
+        ) : null}
+
+        {mode === "A" && choiceStructure ? (
+          <div className="table compact" style={{ marginTop: 12 }}>
+            <div className="row header">
+              <div>Choice Structure</div>
+              <div>Value</div>
+              <div></div>
+              <div></div>
+              <div></div>
+            </div>
+            {[
+              { key: "Correct vs Distractors", value: choiceStructure.correctMeanSim },
+              { key: "Distractor Mean", value: choiceStructure.distractorMeanSim },
+              { key: "Distractor Variance", value: choiceStructure.distractorVariance },
+              { key: "Isolation Index", value: choiceStructure.isolationIndex },
+            ].map((row) => (
+              <div className="row" key={row.key}>
+                <div className="axis">{row.key}</div>
+                <div>{row.value.toFixed(3)}</div>
+                <div></div>
+                <div></div>
+                <div></div>
+              </div>
+            ))}
           </div>
         ) : null}
 

@@ -512,21 +512,77 @@ app.post("/generate/mc", async (req, res) => {
         : 0.85;
     const maxJaccard = 0.75;
 
-    const hasPassage = Boolean(sourceItem.passage && sourceItem.passage.trim());
-    const passageLength = hasPassage ? countWords(sourceItem.passage || "") : 0;
+    const rawPassage = extractPassageFromRaw(sourceText);
+    const hasPassage =
+      Boolean(sourceItem.passage && sourceItem.passage.trim()) ||
+      countWords(rawPassage) >= 40;
+    if (hasPassage && !sourceItem.passage && rawPassage.trim().length > 0) {
+      sourceItem.passage = rawPassage;
+    }
+    const passageLength = hasPassage
+      ? countWords(sourceItem.passage && sourceItem.passage.trim() ? sourceItem.passage : rawPassage)
+      : 0;
+    const passageMin = hasPassage ? Math.max(60, passageLength - 15) : 0;
+    const passageMax = hasPassage ? passageLength + 15 : 0;
     const choiceCount = sourceItem.choices.length;
     const passageHint = hasPassage
-      ? `Passage length: ${Math.max(60, passageLength - 15)}-${passageLength + 15} words.`
+      ? `Passage length: ${passageMin}-${passageMax} words.`
       : "No passage. Only a question.";
 
     const system =
       "You generate inference multiple-choice questions. Return ONLY valid JSON.";
+    let fixedPassage: string | null = null;
+    let fixedPassageWarning: string | null = null;
+    if (hasPassage && !useComboStyle) {
+      const passageSystem = "You generate passages only. Return ONLY the passage text.";
+      const passagePrompt = [
+        `Write a passage between ${passageMin}-${passageMax} words.`,
+        modeLabel === "A"
+          ? "Topic can be different from the source."
+          : "Keep the same topic as the source.",
+        "No bullet points. No titles. Plain paragraphs only.",
+      ].join("\n");
+      const passageAttempts = modeLabel === "B" ? 3 : 3;
+      let closest: { text: string; diff: number; len: number } | null = null;
+      for (let i = 0; i < passageAttempts; i += 1) {
+        const candidate = (await generationProvider.generateText(passagePrompt, passageSystem)).trim();
+        const len = countWords(candidate);
+        if (len >= passageMin && len <= passageMax) {
+          fixedPassage = candidate;
+          break;
+        }
+        if (len > 0) {
+          const diff = Math.abs(len - passageLength);
+          if (!closest || diff < closest.diff) {
+            closest = { text: candidate, diff, len };
+          }
+        }
+      }
+      if (!fixedPassage && closest) {
+        const allowedDiff = Math.max(60, Math.round(passageLength * 0.35));
+        if (closest.diff <= allowedDiff) {
+          fixedPassage = closest.text;
+          fixedPassageWarning = `Passage length ${closest.len} words (target ${passageLength}).`;
+        }
+      }
+      if (!fixedPassage) {
+        const fallback = sourceItem.passage || rawPassage;
+        if (fallback && fallback.trim().length > 0) {
+          fixedPassage = fallback.trim();
+          fixedPassageWarning = "Used source passage as fallback.";
+        }
+      }
+      if (!fixedPassage) {
+        return res.status(400).json({ error: "Failed to generate passage within length range." });
+      }
+    }
     const themeSource =
       modeLabel === "B" && expectedSubtype === "combo"
         ? extractComboStatements(sourceText).join("\n")
         : sourceText;
     const themeKeywords = modeLabel === "B" ? extractThemeKeywords(themeSource) : [];
     const choiceIntent = modeLabel === "B" ? await extractChoiceIntent(sourceText) : null;
+    const candidateCount = modeLabel === "B" ? 2 : 1;
     let sourceCombined =
       expectedSubtype === "combo"
         ? normalizeForSimilarity(extractStatementText(sourceText))
@@ -539,6 +595,7 @@ app.post("/generate/mc", async (req, res) => {
     const prompt = [
       "Create a NEW multiple-choice question that matches the input format.",
       "Do NOT copy the source. Do NOT reuse any 3-word sequence.",
+      `Generate ${candidateCount} candidates.`,
       `Keep exactly ${choiceCount} choices with exactly 1 correct answer.`,
       `Your choices array MUST have exactly ${choiceCount} items.`,
       "Question type: inference only.",
@@ -558,6 +615,9 @@ app.post("/generate/mc", async (req, res) => {
       useComboStyle
         ? "For combo format, set passage to null. Put the instruction line and the ア〜エ statements in the question field only. Do NOT include any long explanatory passage."
         : "",
+      hasPassage && !useComboStyle
+        ? `Use this passage exactly and set it as the passage field:\n${fixedPassage ?? ""}`
+        : "",
       "The question field must NOT include the choices. Choices must appear only in the choices array.",
       modeLabel === "B" && themeKeywords.length
         ? `Keep these key terms/themes present: ${themeKeywords.join(", ")}.`
@@ -569,7 +629,7 @@ app.post("/generate/mc", async (req, res) => {
             2
           )}, ${target.A.toFixed(2)}, ${target.R.toFixed(2)}.`
         : "Target profile: not provided.",
-      "Return JSON: {\"passage\": string|null, \"question\": string, \"choices\": [string,...], \"correctIndex\": 0-(choices.length-1)}",
+      "Return JSON: {\"candidates\":[{\"passage\": string|null, \"question\": string, \"choices\": [string,...], \"correctIndex\": 0-(choices.length-1)}]}",
       useComboStyle
         ? "Choices may include numbering like '1. アイ' if that matches the source."
         : "Choices must be plain text (no labels).",
@@ -582,140 +642,183 @@ app.post("/generate/mc", async (req, res) => {
     let llmLastText: string | null = null;
     let llmLastValidationReason: string | null = null;
 
-    const maxAttempts = expectedSubtype === "combo" ? 8 : 5;
+    const maxAttempts = modeLabel === "B" ? 2 : 1;
+    let best: {
+      item: MultipleChoiceItem;
+      sim: number;
+      jaccard: number;
+      similarityBreakdown: {
+        passage: number | null;
+        question: number | null;
+        correctChoice: number | null;
+        distractors: number | null;
+        choices: number | null;
+      };
+      choiceStructure: {
+        correctMeanSim: number;
+        distractorMeanSim: number;
+        distractorVariance: number;
+        isolationIndex: number;
+      } | null;
+      score: number;
+    } | null = null;
+
     for (let i = 0; i < maxAttempts; i += 1) {
       llmAttempted = true;
       const raw = await generationProvider.generateText(prompt, system);
       llmLastText = raw;
-      const parsed = extractJsonObject<MultipleChoiceItem>(raw);
-      if (!parsed) {
+      const candidates = extractCandidates<MultipleChoiceItem>(raw);
+      if (candidates.length === 0) {
         llmLastValidationReason = "LLM response was not valid JSON.";
         continue;
       }
-      parsed.question = dedupeQuestionLines(parsed.question);
-      parsed.choices = parsed.choices.map(normalizeChoice);
-      if (parsed.choices.length !== choiceCount) {
-        llmLastValidationReason = `Choice count does not match source. expected=${choiceCount} actual=${parsed.choices.length}`;
-        continue;
-      }
-      if (questionContainsChoices(parsed.question)) {
-        llmLastValidationReason = "Question field contains choices.";
-        continue;
-      }
-      if (expectedSubtype === "combo" && !detectComboChoices(parsed.choices)) {
-        llmLastValidationReason = "Choices are not in combination format (アイ/アウ...).";
-        continue;
-      }
-      const error = validateMultipleChoice(parsed);
-      if (error) {
-        llmLastValidationReason = error;
-        continue;
-      }
-      if (hasPassage && (!parsed.passage || !parsed.passage.trim())) {
-        if (expectedSubtype === "combo") {
+      for (const parsed of candidates) {
+        parsed.question = dedupeQuestionLines(parsed.question);
+        parsed.choices = parsed.choices.map(normalizeChoice);
+        if (hasPassage && !useComboStyle && fixedPassage) {
+          parsed.passage = fixedPassage;
+          parsed.question = stripEmbeddedPassage(parsed.question, fixedPassage);
+        }
+        if (parsed.choices.length !== choiceCount) continue;
+        if (questionContainsChoices(parsed.question)) continue;
+        if (expectedSubtype === "combo" && !detectComboChoices(parsed.choices)) continue;
+        const error = validateMultipleChoice(parsed);
+        if (error) continue;
+        if (hasPassage && !useComboStyle) {
+          if (!parsed.passage || !parsed.passage.trim()) continue;
+        } else if (hasPassage && expectedSubtype === "combo") {
           parsed.passage = null;
-        } else {
-          llmLastValidationReason = "Missing passage.";
+        }
+        if (hasPassage && parsed.passage && !useComboStyle) {
+          const genLen = countWords(parsed.passage);
+          if (genLen < passageMin || genLen > passageMax) continue;
+        }
+        if (!hasPassage && parsed.passage && parsed.passage.trim().length > 0) {
+          parsed.passage = null;
+        }
+        if (expectedSubtype === "combo") {
+          const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
+          const statements = extractComboStatements(combinedText);
+          if (statements.length < (statementLabels.length || 4)) continue;
+        }
+        if (modeLabel === "B" && themeKeywords.length) {
+          const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
+          const hits = themeKeywords.filter((k) => combinedText.includes(k));
+          const requiredHits = themeKeywords.length >= 4 ? 2 : 1;
+          if (hits.length < requiredHits) continue;
+        }
+        if (modeLabel === "B") {
+          const sourceTopicText =
+            expectedSubtype === "combo"
+              ? extractComboStatements(sourceText).join("\n")
+              : sourceText;
+          const generatedTopicText =
+            expectedSubtype === "combo"
+              ? extractComboStatements(
+                  `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`
+                ).join("\n")
+              : `${parsed.passage ?? ""}\n${parsed.question}`;
+          const themeCheck = await semanticThemeCheck(sourceTopicText, generatedTopicText);
+          if (!themeCheck.ok) continue;
+        }
+        const correctChoice = parsed.choices[parsed.correctIndex];
+        if (correctChoice && correctChoice.trim().toLowerCase() === sourceCorrect.toLowerCase()) {
           continue;
         }
-      }
-      if (!hasPassage && parsed.passage && parsed.passage.trim().length > 0) {
-        parsed.passage = null;
-      }
-      if (expectedSubtype === "combo") {
-        const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
-        const statements = extractComboStatements(combinedText);
-        if (statements.length < (statementLabels.length || 4)) {
-          llmLastValidationReason = "Missing combo statements (ア・イ・ウ・エ).";
-          continue;
-        }
-      }
-      if (modeLabel === "B" && themeKeywords.length) {
-        const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
-        const hits = themeKeywords.filter((k) => combinedText.includes(k));
-        const requiredHits = themeKeywords.length >= 4 ? 2 : 1;
-        if (hits.length < requiredHits) {
-          llmLastValidationReason = `Missing theme keywords: ${themeKeywords
-            .filter((k) => !combinedText.includes(k))
-            .slice(0, 3)
-            .join(", ")}`;
-          continue;
-        }
-      }
-      if (modeLabel === "B") {
-        const sourceTopicText =
+        let combined =
           expectedSubtype === "combo"
-            ? extractComboStatements(sourceText).join("\n")
-            : sourceText;
-        const generatedTopicText =
-          expectedSubtype === "combo"
-            ? extractComboStatements(
-                `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`
-              ).join("\n")
-            : `${parsed.passage ?? ""}\n${parsed.question}`;
-        const themeCheck = await semanticThemeCheck(sourceTopicText, generatedTopicText);
-        if (!themeCheck.ok) {
-          llmLastValidationReason = themeCheck.reason || "Semantic topic mismatch.";
-          continue;
-        }
-      }
-      const correctChoice = parsed.choices[parsed.correctIndex];
-      if (correctChoice && correctChoice.trim().toLowerCase() === sourceCorrect.toLowerCase()) {
-        llmLastValidationReason = "Correct answer reused from source.";
-        continue;
-      }
-      let combined =
-        expectedSubtype === "combo"
-          ? normalizeForSimilarity(
-              extractStatementText(
-                `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`
+            ? normalizeForSimilarity(
+                extractStatementText(
+                  `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`
+                )
               )
-            )
-          : normalizeForSimilarity(buildCombinedText(parsed));
-      if (!combined.trim()) {
-        const fallbackText = parsed.passage ? parsed.passage : parsed.question;
-        combined = normalizeForSimilarity(
-          expectedSubtype === "combo" ? extractStatementText(fallbackText) : fallbackText
-        );
+            : normalizeForSimilarity(buildCombinedText(parsed));
         if (!combined.trim()) {
-          combined = normalizeForSimilarity(buildCombinedText(parsed));
+          const fallbackText = parsed.passage ? parsed.passage : parsed.question;
+          combined = normalizeForSimilarity(
+            expectedSubtype === "combo" ? extractStatementText(fallbackText) : fallbackText
+          );
+          if (!combined.trim()) {
+            combined = normalizeForSimilarity(buildCombinedText(parsed));
+          }
         }
-      }
-      const candidateVec = await embeddingProvider.embedText(combined, 8);
-      const sim = cosineSimilarity(sourceVec, candidateVec);
-      const jaccard = tokenJaccard(sourceCombined, combined);
-      llmLastSim = sim;
-      llmLastJaccard = jaccard;
-        if (sim >= minSim && sim <= maxSim && jaccard <= maxJaccard) {
-          const textSim = async (a: string | null | undefined, b: string | null | undefined) => {
-            if (!a || !b) return null;
-            const aVec = await embeddingProvider.embedText(normalizeForSimilarity(a), 8);
-            const bVec = await embeddingProvider.embedText(normalizeForSimilarity(b), 8);
-            return cosineSimilarity(aVec, bVec);
-          };
-          const passageSim = await textSim(sourceItem.passage, parsed.passage);
-          const questionSim = await textSim(
-            stripGenericQuestionLines(sourceItem.question),
-            stripGenericQuestionLines(parsed.question)
+        const candidateVec = await embeddingProvider.embedText(combined, 8);
+        const sim = cosineSimilarity(sourceVec, candidateVec);
+        const jaccard = tokenJaccard(sourceCombined, combined);
+        if (sim < minSim || sim > maxSim || jaccard > maxJaccard) continue;
+        llmLastSim = sim;
+        llmLastJaccard = jaccard;
+        const textSim = async (a: string | null | undefined, b: string | null | undefined) => {
+          if (!a || !b) return null;
+          const aVec = await embeddingProvider.embedText(normalizeForSimilarity(a), 8);
+          const bVec = await embeddingProvider.embedText(normalizeForSimilarity(b), 8);
+          return cosineSimilarity(aVec, bVec);
+        };
+        const passageSim = await textSim(sourceItem.passage, parsed.passage);
+        const questionSim = await textSim(
+          stripGenericQuestionLines(sourceItem.question),
+          stripGenericQuestionLines(parsed.question)
+        );
+        const correctChoiceSim = await textSim(
+          sourceItem.choices[sourceItem.correctIndex],
+          parsed.choices[parsed.correctIndex]
+        );
+        const distractorSim = await textSim(
+          sourceItem.choices.filter((_c, i) => i !== sourceItem.correctIndex).join(" "),
+          parsed.choices.filter((_c, i) => i !== parsed.correctIndex).join(" ")
+        );
+        const overallChoicesSim =
+          correctChoiceSim != null && distractorSim != null
+            ? (correctChoiceSim + distractorSim) / 2
+            : correctChoiceSim ?? distractorSim;
+        const choiceTexts = parsed.choices.map((c) => normalizeForSimilarity(c));
+        const vectors = await embeddingProvider.embedTexts(choiceTexts, 8);
+        const correctIdx = Math.min(Math.max(parsed.correctIndex, 0), vectors.length - 1);
+        const correctVec = vectors[correctIdx];
+        const distractorVecs = vectors.filter((_v, idx) => idx !== correctIdx);
+        const correctToDistractors = distractorVecs.map((v) =>
+          cosineSimilarity(correctVec, v)
+        );
+        const distractorPairwise = pairwiseSimilarities(distractorVecs);
+        const correctMean = mean(correctToDistractors);
+        const distractorMean = mean(distractorPairwise);
+        const distractorVar = std(distractorPairwise);
+        const isolation = correctMean - distractorMean;
+        const resolvedChoiceStructure =
+          modeLabel === "A"
+            ? {
+                correctMeanSim: correctMean,
+                distractorMeanSim: distractorMean,
+                distractorVariance: distractorVar,
+                isolationIndex: isolation,
+              }
+            : null;
+        let score = Math.abs(sim - (modeLabel === "A" ? 0.6 : 0.8));
+        if (target) {
+          const combinedText = parsed.passage ? `${parsed.passage}\n\n${parsed.question}` : parsed.question;
+          const lexical = computeLexicalComplexity(combinedText);
+          const structural = computeStructuralComplexity(combinedText);
+          const correctVec2 = await embeddingProvider.embedText(
+            parsed.choices[parsed.correctIndex],
+            8
           );
-          const correctChoiceSim = await textSim(
-            sourceItem.choices[sourceItem.correctIndex],
-            parsed.choices[parsed.correctIndex]
+          const distractorVecs2 = await embeddingProvider.embedTexts(
+            parsed.choices.filter((_c, idx) => idx !== parsed.correctIndex),
+            8
           );
-          const distractorSim = await textSim(
-            sourceItem.choices.filter((_c, i) => i !== sourceItem.correctIndex).join(" "),
-            parsed.choices.filter((_c, i) => i !== parsed.correctIndex).join(" ")
-          );
-          const overallChoicesSim =
-            correctChoiceSim != null && distractorSim != null
-              ? (correctChoiceSim + distractorSim) / 2
-              : correctChoiceSim ?? distractorSim;
-          return res.json({
+          const A = semanticAmbiguityA(correctVec2, distractorVecs2);
+          const R = normalizeReasoningDepth(2, 5);
+          const dL = lexical.L - target.L;
+          const dS = structural.S - target.S;
+          const dA = A - target.A;
+          const dR = R - target.R;
+          score = Math.sqrt(dL * dL + dS * dS + dA * dA + dR * dR);
+        }
+        if (!best || score < best.score) {
+          best = {
             item: parsed,
-            format: "multiple_choice",
-            similarity: sim,
+            sim,
             jaccard,
-            similarityRange: { min: minSim, max: maxSim, maxJaccard },
             similarityBreakdown: {
               passage: passageSim,
               question: questionSim,
@@ -723,11 +826,26 @@ app.post("/generate/mc", async (req, res) => {
               distractors: distractorSim,
               choices: overallChoicesSim,
             },
-            mode: modeLabel,
-            choiceIntent: choiceIntent ?? undefined,
-          });
+            choiceStructure: resolvedChoiceStructure,
+            score,
+          };
         }
-      llmLastValidationReason = "Generated problem too similar to source.";
+      }
+    }
+
+    if (best) {
+      return res.json({
+        item: best.item,
+        format: "multiple_choice",
+        similarity: best.sim,
+        jaccard: best.jaccard,
+        similarityRange: { min: minSim, max: maxSim, maxJaccard },
+        similarityBreakdown: best.similarityBreakdown,
+        mode: modeLabel,
+        choiceIntent: choiceIntent ?? undefined,
+        choiceStructure: best.choiceStructure,
+        passageWarning: fixedPassageWarning ?? undefined,
+      });
     }
 
     return res.status(422).json({
@@ -1037,9 +1155,24 @@ async function extractChoiceIntent(
   return { concept: parsed.concept, patterns };
 }
 
+function extractCandidates<T>(raw: string): T[] {
+  const parsed = extractJsonObject<{ candidates?: T[] }>(raw);
+  if (parsed?.candidates && Array.isArray(parsed.candidates)) {
+    return parsed.candidates;
+  }
+  const single = extractJsonObject<T>(raw);
+  return single ? [single] : [];
+}
+
 function questionContainsChoices(question: string) {
   const lines = question.split(/\r?\n/).map((l) => l.trim());
-  return lines.some((l) => /^[\d０-９]+[．\.\)]/.test(l) || /[ア-エ]と[ア-エ]/.test(l));
+  return lines.some(
+    (l) =>
+      /^[\d０-９]+[．\.\)]/.test(l) ||
+      /^\s*[A-D]\s+/.test(l) ||
+      /^\s*[A-D][\).:\-]/.test(l) ||
+      /[ア-エ]と[ア-エ]/.test(l)
+  );
 }
 
 function dedupeQuestionLines(question: string) {
@@ -1063,6 +1196,16 @@ function dedupeQuestionLines(question: string) {
   return out.join("\n");
 }
 
+function stripEmbeddedPassage(question: string, passage: string | null) {
+  if (!passage) return question;
+  const trimmedPassage = passage.trim();
+  if (!trimmedPassage) return question;
+  if (question.includes(trimmedPassage)) {
+    return question.replace(trimmedPassage, "").trim();
+  }
+  return question;
+}
+
 function stripGenericQuestionLines(question: string) {
   const lines = question
     .split(/\r?\n/)
@@ -1075,6 +1218,18 @@ function stripGenericQuestionLines(question: string) {
   return filtered.join("\n");
 }
 
+function extractPassageFromRaw(sourceText: string): string {
+  const lines = sourceText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length < 3) return "";
+  const choiceStart = findChoiceBlockStart(lines);
+  if (choiceStart < 1) return "";
+  const passageLines = lines.slice(0, Math.max(0, choiceStart + 1));
+  return passageLines.join("\n").trim();
+}
+
 function averageVector(vectors: number[][]): number[] {
   if (vectors.length === 0) return [];
   const dim = vectors[0].length;
@@ -1083,6 +1238,28 @@ function averageVector(vectors: number[][]): number[] {
     for (let i = 0; i < dim; i += 1) sums[i] += vec[i];
   }
   return sums.map((v) => v / vectors.length);
+}
+
+function pairwiseSimilarities(vectors: number[][]): number[] {
+  const sims: number[] = [];
+  for (let i = 0; i < vectors.length; i += 1) {
+    for (let j = i + 1; j < vectors.length; j += 1) {
+      sims.push(cosineSimilarity(vectors[i], vectors[j]));
+    }
+  }
+  return sims;
+}
+
+function mean(values: number[]) {
+  if (values.length === 0) return 0;
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function std(values: number[]) {
+  if (values.length <= 1) return 0;
+  const m = mean(values);
+  const variance = mean(values.map((v) => (v - m) ** 2));
+  return Math.sqrt(variance);
 }
 function detectJapaneseCombinationStyle(sourceText: string) {
   const hasStatements = /[ア-エ]．/.test(sourceText);
@@ -1108,6 +1285,33 @@ function splitInlineChoices(line: string): string[] | null {
   const matches = [...line.matchAll(/(?:^|\s)([\d０-９]+)[．\.\)]\s*([^\s]+)/g)];
   if (matches.length < 2) return null;
   return matches.map((m) => `${m[1]}. ${m[2]}`);
+}
+
+function getChoiceLabel(line: string): { type: "alpha"; label: string } | { type: "num" } | null {
+  if (/^\s*[\d０-９]+[．\.\)]\s+/.test(line)) return { type: "num" };
+  const punct = line.match(/^\s*([A-D])[\).:\-]\s+/i);
+  if (punct) return { type: "alpha", label: punct[1].toUpperCase() };
+  const spaced = line.match(/^\s*([A-D])\s+\S+/i);
+  if (spaced) return { type: "alpha", label: spaced[1].toUpperCase() };
+  return null;
+}
+
+function findChoiceBlockStart(lines: string[]): number {
+  let idx = lines.length - 1;
+  const labels: string[] = [];
+  while (idx >= 0) {
+    const label = getChoiceLabel(lines[idx]);
+    if (!label) break;
+    labels.push(label.type === "alpha" ? label.label : "num");
+    idx -= 1;
+  }
+  if (labels.length < 2) return -1;
+  const alphaLabels = labels.filter((l) => l !== "num");
+  if (alphaLabels.length > 0) {
+    const distinct = new Set(alphaLabels);
+    if (distinct.size < 3) return -1;
+  }
+  return idx;
 }
 
 function tryParseMultipleChoiceHeuristic(sourceText: string): MultipleChoiceItem | null {
@@ -1151,18 +1355,14 @@ function tryParseMultipleChoiceHeuristic(sourceText: string): MultipleChoiceItem
     lines.splice(answerLineIndex, 1);
   }
 
-  const choicePattern = /^\s*[\d０-９]+[．\.\)]|^\s*[A-D][\).:\-]/i;
-  let choiceStart = lines.length - 1;
-  while (choiceStart >= 0 && choicePattern.test(lines[choiceStart])) {
-    choiceStart -= 1;
-  }
+  const choiceStart = findChoiceBlockStart(lines);
   const choiceLines = lines.slice(choiceStart + 1);
   const questionLine = lines[choiceStart];
   if (!questionLine || choiceLines.length < 2) return null;
 
   const normalizedChoices = choiceLines.map(normalizeChoice);
   const question = questionLine.replace(/^question\s*:\s*/i, "").trim();
-  const passageLines = lines.slice(0, Math.max(0, lines.length - 5));
+  const passageLines = lines.slice(0, Math.max(0, choiceStart));
   const passage = passageLines.length
     ? passageLines.join("\n").replace(/^passage\s*:\s*/i, "").trim()
     : null;
@@ -1211,6 +1411,27 @@ async function parseMultipleChoice(sourceText: string): Promise<MultipleChoiceIt
   if (!generationProvider) {
     throw new Error("Generation provider not configured.");
   }
+  const normalizeSystem =
+    "You normalize pasted multiple-choice problems into a clean, parseable format. Return ONLY plain text.";
+  const normalizePrompt = [
+    "Rewrite the input into the following format with one item per line:",
+    "Passage: ... (optional, omit if none)",
+    "Question: ...",
+    "A) ...",
+    "B) ...",
+    "C) ...",
+    "D) ...",
+    "If there are 5-8 choices, continue with E) F) etc.",
+    "Remove stray symbols like | and extra whitespace.",
+    "Do NOT change meaning.",
+    `Input:\n${sourceText}`,
+  ].join("\n");
+  const normalizedText = await generationProvider.generateText(
+    normalizePrompt,
+    normalizeSystem
+  );
+  const normalizedHeuristic = tryParseMultipleChoiceHeuristic(normalizedText);
+  if (normalizedHeuristic) return normalizedHeuristic;
   const system =
     "You extract multiple-choice questions. Return ONLY valid JSON with strict fields.";
   const prompt = [

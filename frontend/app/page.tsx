@@ -34,6 +34,12 @@ type ChoiceIntent = {
   concept: string;
   patterns: string[];
 };
+type ChoiceStructure = {
+  correctMeanSim: number;
+  distractorMeanSim: number;
+  distractorVariance: number;
+  isolationIndex: number;
+};
 
 export default function Home() {
   const apiBase = useMemo(
@@ -62,6 +68,7 @@ export default function Home() {
   const [similarity, setSimilarity] = useState<number | null>(null);
   const [similarityBreakdown, setSimilarityBreakdown] = useState<SimilarityBreakdown | null>(null);
   const [choiceIntent, setChoiceIntent] = useState<ChoiceIntent | null>(null);
+  const [choiceStructure, setChoiceStructure] = useState<ChoiceStructure | null>(null);
   const [mode, setMode] = useState<"A" | "B">("A");
 
   useEffect(() => {
@@ -141,6 +148,7 @@ export default function Home() {
         similarity?: number;
         similarityBreakdown?: SimilarityBreakdown;
         choiceIntent?: ChoiceIntent;
+        choiceStructure?: ChoiceStructure;
       };
       setPassage(data.item.passage || "");
       setQuestion(data.item.question);
@@ -149,6 +157,7 @@ export default function Home() {
       setSimilarity(typeof data.similarity === "number" ? data.similarity : null);
       setSimilarityBreakdown(data.similarityBreakdown ?? null);
       setChoiceIntent(data.choiceIntent ?? null);
+      setChoiceStructure(data.choiceStructure ?? null);
       setSelected(null);
       setSubmitted(false);
     } catch (err) {
@@ -157,6 +166,7 @@ export default function Home() {
       setSimilarity(null);
       setSimilarityBreakdown(null);
       setChoiceIntent(null);
+      setChoiceStructure(null);
     } finally {
       setLoading(false);
     }
@@ -315,6 +325,8 @@ export default function Home() {
         similarity={similarity}
         similarityBreakdown={similarityBreakdown}
         choiceIntent={choiceIntent}
+        choiceStructure={choiceStructure}
+        mode={mode}
         error={error}
       />
     </main>
