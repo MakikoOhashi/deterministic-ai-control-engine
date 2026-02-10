@@ -50,7 +50,7 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
 
   constructor(apiKey: string, model: string) {
     this.apiKey = apiKey;
-    this.model = model;
+    this.model = model.replace(/^models\//, "");
   }
 
   async embedText(text: string): Promise<number[]> {
@@ -79,7 +79,10 @@ export class GeminiEmbeddingProvider implements EmbeddingProvider {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        requests: texts.map((text) => ({ content: { parts: [{ text }] } })),
+        requests: texts.map((text) => ({
+          model: `models/${this.model}`,
+          content: { parts: [{ text }] },
+        })),
       }),
     });
     if (!res.ok) {

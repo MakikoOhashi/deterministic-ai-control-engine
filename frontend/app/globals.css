@@ -345,6 +345,23 @@ button:disabled {
   gap: 10px;
 }
 
+.generated-text {
+  font-size: 16px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.inline-blank {
+  display: inline-block;
+  margin: 0 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 16px;
+  line-height: 1.2;
+  min-width: 80px;
+}
+
 .option {
   display: grid;
   grid-template-columns: auto 1fr;

@@ -2,6 +2,10 @@ const WORD_REGEX = /[A-Za-z']+/g;
 const PREFIX_TOKEN_REGEX = /([A-Za-z]+)\s*((?:_\s*){2,})/;
 const COMMON_WORDS = [
   "daily",
+  "problem",
+  "progress",
+  "process",
+  "produce",
   "fat",
   "few",
   "fuel",
@@ -131,6 +135,23 @@ function buildDistractors(sentence: string, target: string): string[] {
     distractors.push(["early", "happy", "warm"][distractors.length % 3]);
   }
   return distractors;
+}
+
+export function buildDistractorsFromText(text: string, target: string): string[] {
+  return buildDistractors(text, target);
+}
+
+export function getBlankPattern(sourceText: string): {
+  prefix: string;
+  blanks: string;
+  blankCount: number;
+} | null {
+  const match = sourceText.match(PREFIX_TOKEN_REGEX);
+  if (!match) return null;
+  const prefix = match[1];
+  const blanks = match[2] || "";
+  const blankCount = (blanks.match(/_/g) || []).length;
+  return { prefix, blanks, blankCount };
 }
 
 function preprocessSource(sourceText: string, preserveBlanks = false): string {

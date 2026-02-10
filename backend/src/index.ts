@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { semanticAmbiguityA } from "./services/difficulty.service.js";
 import {
@@ -16,7 +17,13 @@ import {
 import { DIFFICULTY_WEIGHTS } from "./config/difficulty.config.js";
 import { BASELINE_ITEMS } from "./config/baseline.items.js";
 import { computeTargetProfile } from "./services/target-profile.service.js";
-import { generateFillBlank, generateFillBlankCandidates, normalizeForSimilarity } from "./services/fill-blank.service.js";
+import {
+  buildDistractorsFromText,
+  generateFillBlank,
+  generateFillBlankCandidates,
+  getBlankPattern,
+  normalizeForSimilarity,
+} from "./services/fill-blank.service.js";
 import { computeTargetFromSources } from "./services/target-from-sources.service.js";
 import { targetFromStructure } from "./services/structure-target.service.js";
 import { classifyFormat } from "./services/format-classifier.service.js";
@@ -251,7 +258,7 @@ app.post("/generate/fill-blank", async (req, res) => {
       const valid = candidates.find((c) => validateGenerated(c.text, format).ok);
       return res.json({ item: valid || candidates[0], candidates, format });
     }
-    const scored = [];
+    const scored: Array<{ item: typeof candidates[number]; distance: number; similarity: number; jaccard: number }> = [];
     const normalizedSource = normalizeForSimilarity(sourceText);
     const sourceVec = await embeddingProvider.embedText(normalizedSource, 8);
     for (const c of candidates) {
@@ -318,29 +325,124 @@ app.post("/generate/fill-blank", async (req, res) => {
       }
     }
 
+    let llmAttempted = false;
+    let llmLastSim: number | null = null;
+    let llmLastJaccard: number | null = null;
+    let llmLastText: string | null = null;
+    let llmLastValidationReason: string | null = null;
     if (generationProvider) {
       const base = candidates[0];
+      const pattern = getBlankPattern(sourceText);
       const system =
-        "You are a question rewriter. Output only one sentence. Do not add options or extra text.";
-      const prompt = [
-        "Rewrite the sentence while keeping the exact blank marker pattern.",
-        "Keep the missing word the same.",
-        `Format: ${format}`,
-        `Blanked template: ${base.text}`,
-        `Missing word: ${base.correct}`,
-        `Original example: ${sourceText}`,
-      ].join("\n");
-      const rewritten = await generationProvider.generateText(prompt, system);
-      if (validateGenerated(rewritten, format).ok) {
+        "You generate fill-in-the-blank questions. Return ONLY valid JSON. Never copy the original sentence.";
+      const prompt =
+        format === "prefix_blank" && pattern
+          ? [
+              "Create ONE new sentence similar in meaning but NOT a copy.",
+              "Change the subject and clause order. Replace key phrases with synonyms.",
+              "Do NOT reuse any 3-word sequence from the original.",
+              "Ensure at least 30% of content words are different.",
+              "Keep EXACT prefix blank pattern.",
+              `Prefix: ${pattern.prefix}`,
+              `Blanks: ${pattern.blanks}`,
+              `Total answer length: ${pattern.prefix.length + pattern.blankCount} letters.`,
+              `Answer must start with "${pattern.prefix}" and have exactly ${pattern.blankCount} letters after the prefix.`,
+              "The text must include the full sentence with the blank in place of the answer. Do not truncate after the blank.",
+              "Infer the original answer from context, then choose a DIFFERENT valid answer with the same prefix and length.",
+              "Return JSON: {\"text\":\"...\", \"answer\":\"...\", \"original\":\"...\"}",
+              "The answer must start with the prefix and match total length implied by blanks. Never reuse the original answer.",
+              "Do not add choices or explanations.",
+              `Original: ${sourceText}`,
+            ].join("\n")
+          : [
+              "Create ONE new sentence similar in meaning but NOT a copy.",
+              "Change the subject and clause order. Replace key phrases with synonyms.",
+              "Do NOT reuse any 3-word sequence from the original.",
+              "Ensure at least 30% of content words are different.",
+              "Keep EXACT one blank marked with ____.",
+              "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
+              "Do not add choices or explanations.",
+              `Original: ${sourceText}`,
+            ].join("\n");
+
+      for (let i = 0; i < 3; i += 1) {
+        llmAttempted = true;
+        const raw = await generationProvider.generateText(prompt, system);
+        llmLastText = raw;
+        const parsed = extractJson(raw);
+        if (!parsed) {
+          llmLastValidationReason = "LLM response was not valid JSON.";
+          continue;
+        }
+        let rewritten = parsed.text;
+        if (format === "prefix_blank" && pattern) {
+          const replacePrefixBlank = (input: string) => {
+            const prefixBlankRegex = /([A-Za-z]+)\s*((?:_\s*){2,})/;
+            if (prefixBlankRegex.test(input)) {
+              return input.replace(prefixBlankRegex, `${pattern.prefix}${pattern.blanks}`);
+            }
+            const blankRegex = /(_\s*){2,}/;
+            if (blankRegex.test(input)) {
+              return input.replace(blankRegex, `${pattern.prefix}${pattern.blanks}`);
+            }
+            return input;
+          };
+          rewritten = replacePrefixBlank(rewritten);
+        }
+        const validation = validateGenerated(rewritten, format);
+        if (!validation.ok) {
+          llmLastValidationReason = validation.reason || "Format validation failed.";
+          continue;
+        }
+        if (format === "prefix_blank" && pattern) {
+          const expectedLen = pattern.prefix.length + pattern.blankCount;
+          const rawAnswer = String(parsed.answer || "").trim();
+          const lowerPrefix = pattern.prefix.toLowerCase();
+          const rawOriginal = String((parsed as { original?: string }).original || "").trim();
+          let fullAnswer = rawAnswer;
+          if (rawAnswer.toLowerCase().startsWith(lowerPrefix)) {
+            fullAnswer = rawAnswer;
+          } else if (rawAnswer.length >= pattern.blankCount) {
+            const suffix = rawAnswer.slice(0, pattern.blankCount);
+            fullAnswer = `${pattern.prefix}${suffix}`;
+          } else {
+            llmLastValidationReason = "Answer does not start with required prefix.";
+            continue;
+          }
+          if (fullAnswer.length !== expectedLen) {
+            llmLastValidationReason = "Answer length does not match blank length.";
+            continue;
+          }
+          parsed.answer = fullAnswer;
+          if (!rawOriginal) {
+            llmLastValidationReason = "LLM did not provide original answer.";
+            continue;
+          }
+          const normalizedOriginal = rawOriginal.toLowerCase();
+          const originalFull = normalizedOriginal.startsWith(lowerPrefix)
+            ? normalizedOriginal
+            : `${lowerPrefix}${normalizedOriginal}`;
+          if (parsed.answer.toLowerCase() === originalFull) {
+            llmLastValidationReason = "Answer reused the original word.";
+            continue;
+          }
+        }
         const candidateVec = await embeddingProvider.embedText(
           normalizeForSimilarity(rewritten),
           8
         );
         const sim = cosineSimilarity(sourceVec, candidateVec);
         const jaccard = tokenJaccard(normalizedSource, normalizeForSimilarity(rewritten));
+        llmLastSim = sim;
+        llmLastJaccard = jaccard;
         if (sim >= MIN_SIM && sim <= MAX_SIM && jaccard <= MAX_JACCARD) {
           return res.json({
-            item: { ...base, text: rewritten },
+            item: {
+              text: rewritten,
+              correct: parsed.answer,
+              distractors: buildDistractorsFromText(rewritten, parsed.answer),
+              steps: base.steps,
+            },
             candidates: scored,
             format,
             similarity: sim,
@@ -354,6 +456,16 @@ app.post("/generate/fill-blank", async (req, res) => {
     return res.status(422).json({
       error: "Generated problem too similar to source. Please try again.",
       similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+      debug: {
+        llmAttempted,
+        llmLastSim,
+        llmLastJaccard,
+        llmLastText,
+        llmLastValidationReason,
+        topCandidates: scored
+          .slice(0, 3)
+          .map((s) => ({ similarity: s.similarity, jaccard: s.jaccard })),
+      },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -433,4 +545,19 @@ function tokenJaccard(a: string, b: string): number {
     if (tokensB.has(t)) inter += 1;
   }
   return union.size === 0 ? 0 : inter / union.size;
+}
+
+function extractJson(text: string): { text: string; answer: string } | null {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    const obj = JSON.parse(text.slice(start, end + 1));
+    if (typeof obj.text === "string" && typeof obj.answer === "string") {
+      return { text: obj.text.trim(), answer: obj.answer.trim() };
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }

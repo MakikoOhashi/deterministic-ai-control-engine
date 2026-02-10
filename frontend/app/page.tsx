@@ -163,12 +163,7 @@ export default function Home() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
-      setText("");
-      setCorrect("");
-      setDistractors([]);
-      setFormat(null);
-      setSelected(null);
-      setBlankAnswer("");
+      setSimilarity(null);
     } finally {
       setLoading(false);
     }
@@ -209,7 +204,9 @@ export default function Home() {
 
   const isCorrect = submitted && selected === correct;
   const hasBlank = format === "full_blank" || format === "prefix_blank" || /(_\s*){2,}/.test(text);
-  const prefixMatch = text.match(/([A-Za-z]+)\s*((?:_\s*){2,})/);
+  const prefixRegex = /([A-Za-z]+)\s*((?:_\s*){2,})/;
+  const fullBlankRegex = /(_\s*){2,}/;
+  const prefixMatch = prefixRegex.exec(text);
   const prefix = prefixMatch ? prefixMatch[1] : "";
   const blankCount = prefixMatch ? (prefixMatch[2].match(/_/g) || []).length : 0;
   const isPrefixBlank = format === "prefix_blank" || (!!prefixMatch && blankCount > 0);
@@ -219,7 +216,10 @@ export default function Home() {
   const blankCorrect =
     submitted &&
     (userAnswer === correctLower ||
-      (isPrefixBlank && userAnswer === suffix && suffix.length === blankCount));
+      (isPrefixBlank &&
+        userAnswer === suffix &&
+        suffix.length === blankCount &&
+        correctLower === `${prefix.toLowerCase()}${userAnswer}`));
 
   const hints = [
     target && result
@@ -263,17 +263,39 @@ export default function Home() {
 
             <div className="generated">
               <div className="generated-title">Generated Question</div>
-              <div className="generated-text">{text || "—"}</div>
               {hasBlank ? (
-                <div className="field" style={{ marginTop: 12 }}>
-                  <label>{isPrefixBlank ? "Type the missing letters" : "Type the missing word"}</label>
-                  <input
-                    value={blankAnswer}
-                    onChange={(e) => setBlankAnswer(e.target.value)}
-                    placeholder="Your answer"
-                  />
+                <div className="generated-text">
+                  {(() => {
+                    const match = isPrefixBlank ? prefixMatch : fullBlankRegex.exec(text);
+                    if (!match || match.index == null) {
+                      return <span>{text || "—"}</span>;
+                    }
+                    const idx = match.index;
+                    const before = text.slice(0, idx);
+                    const after = text.slice(idx + match[0].length);
+                    const underscoreCount = (match[0].match(/_/g) || []).length;
+                    return (
+                      <>
+                        <span>{before}</span>
+                        {isPrefixBlank && prefix ? <span>{prefix}</span> : null}
+                        <input
+                          className="inline-blank"
+                          value={blankAnswer}
+                          onChange={(e) => setBlankAnswer(e.target.value)}
+                          placeholder={"_".repeat(Math.max(underscoreCount, 3))}
+                          maxLength={underscoreCount || undefined}
+                          size={Math.max(underscoreCount, 6)}
+                          autoComplete="off"
+                        />
+                        <span>{after}</span>
+                      </>
+                    );
+                  })()}
                 </div>
               ) : (
+                <div className="generated-text">{text || "—"}</div>
+              )}
+              {!hasBlank ? (
                 <div className="options">
                   {[correct, ...distractors].filter(Boolean).map((opt) => (
                     <label key={opt} className="option">
@@ -288,7 +310,7 @@ export default function Home() {
                     </label>
                   ))}
                 </div>
-              )}
+              ) : null}
               <div className="actions">
                 <button
                   onClick={() => setSubmitted(true)}
