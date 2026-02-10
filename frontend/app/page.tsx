@@ -112,7 +112,11 @@ export default function Home() {
       const res = await fetch(`${apiBase}/generate/mc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sourceText, target: targetOverride ?? target }),
+        body: JSON.stringify({
+          sourceText,
+          target: targetOverride ?? target,
+          mode,
+        }),
       });
       if (!res.ok) {
         const err = await res.json();
@@ -225,7 +229,7 @@ export default function Home() {
           <div className="mode-note">
             {mode === "A"
               ? "Cognitive Match (ability-based). Topic can change; difficulty profile must match."
-              : "Concept Preservation (domain-specific). Keep topic; rephrase only. (Planned)"} 
+              : "Concept Preservation (domain-specific). Keep topic; rephrase only."}
           </div>
         </div>
         <div className="field">

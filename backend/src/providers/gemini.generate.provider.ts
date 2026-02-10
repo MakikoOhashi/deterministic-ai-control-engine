@@ -33,7 +33,7 @@ export class GeminiTextGenerationProvider implements TextGenerationProvider {
           ],
         generationConfig: {
           temperature: 0.7,
-          maxOutputTokens: 600,
+          maxOutputTokens: 900,
         },
         }),
       });

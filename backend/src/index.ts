@@ -251,9 +251,10 @@ app.post("/difficulty/overall", async (req, res) => {
 
 app.post("/generate/fill-blank", async (req, res) => {
   try {
-    const { sourceText, target } = req.body as {
+    const { sourceText, target, mode } = req.body as {
       sourceText: string;
       target?: { L: number; S: number; A: number; R: number };
+      mode?: "A" | "B";
     };
     if (typeof sourceText !== "string") {
       return res.status(400).json({ error: "Expected { sourceText: string }" });
@@ -484,9 +485,10 @@ app.post("/generate/fill-blank", async (req, res) => {
 
 app.post("/generate/mc", async (req, res) => {
   try {
-    const { sourceText, target } = req.body as {
+    const { sourceText, target, mode } = req.body as {
       sourceText: string;
       target?: { L: number; S: number; A: number; R: number };
+      mode?: "A" | "B";
     };
     if (!sourceText || typeof sourceText !== "string") {
       return res.status(400).json({ error: "sourceText is required." });
@@ -499,7 +501,15 @@ app.post("/generate/mc", async (req, res) => {
     const statementLabels = useComboStyle ? extractJapaneseStatementLabels(sourceText) : [];
     const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
     const minSim = 0.4;
-    const maxSim = expectedSubtype === "combo" ? 0.92 : 0.85;
+    const modeLabel = mode === "B" ? "B" : "A";
+    const maxSim =
+      modeLabel === "B"
+        ? expectedSubtype === "combo"
+          ? 0.96
+          : 0.92
+        : expectedSubtype === "combo"
+        ? 0.92
+        : 0.85;
     const maxJaccard = 0.75;
 
     const hasPassage = Boolean(sourceItem.passage && sourceItem.passage.trim());
@@ -511,6 +521,11 @@ app.post("/generate/mc", async (req, res) => {
 
     const system =
       "You generate inference multiple-choice questions. Return ONLY valid JSON.";
+    const themeSource =
+      modeLabel === "B" && expectedSubtype === "combo"
+        ? extractComboStatements(sourceText).join("\n")
+        : sourceText;
+    const themeKeywords = modeLabel === "B" ? extractThemeKeywords(themeSource) : [];
     let sourceCombined =
       expectedSubtype === "combo"
         ? normalizeForSimilarity(extractStatementText(sourceText))
@@ -528,8 +543,19 @@ app.post("/generate/mc", async (req, res) => {
       "Question type: inference only.",
       "Use the same language as the source.",
       useComboStyle
-        ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Do NOT paraphrase the original statements. Replace them with different audit topics (e.g., internal control, going concern, subsequent events, materiality, audit risk). Each statement must introduce a different concept from the source.`
+        ? modeLabel === "B"
+          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same audit topic and concept, but rephrase each statement with different wording.`
+          : `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Do NOT paraphrase the original statements. Replace them with different audit topics (e.g., internal control, going concern, subsequent events, materiality, audit risk). Each statement must introduce a different concept from the source.`
+        : modeLabel === "B"
+        ? "Match the overall style and structure of the source. Preserve the same topic and intent, but rephrase the content."
         : "Match the overall style and structure of the source.",
+      useComboStyle
+        ? "For combo format, set passage to null. Put the instruction line and the ア〜エ statements in the question field only. Do NOT include any long explanatory passage."
+        : "",
+      "The question field must NOT include the choices. Choices must appear only in the choices array.",
+      modeLabel === "B" && themeKeywords.length
+        ? `Keep these key terms/themes present: ${themeKeywords.join(", ")}.`
+        : "",
       "Return ONLY valid JSON in a single line. No markdown, no code fences.",
       passageHint,
       target
@@ -560,9 +586,14 @@ app.post("/generate/mc", async (req, res) => {
         llmLastValidationReason = "LLM response was not valid JSON.";
         continue;
       }
+      parsed.question = dedupeQuestionLines(parsed.question);
       parsed.choices = parsed.choices.map(normalizeChoice);
       if (parsed.choices.length !== choiceCount) {
         llmLastValidationReason = `Choice count does not match source. expected=${choiceCount} actual=${parsed.choices.length}`;
+        continue;
+      }
+      if (questionContainsChoices(parsed.question)) {
+        llmLastValidationReason = "Question field contains choices.";
         continue;
       }
       if (expectedSubtype === "combo" && !detectComboChoices(parsed.choices)) {
@@ -593,6 +624,35 @@ app.post("/generate/mc", async (req, res) => {
           continue;
         }
       }
+      if (modeLabel === "B" && themeKeywords.length) {
+        const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
+        const hits = themeKeywords.filter((k) => combinedText.includes(k));
+        const requiredHits = themeKeywords.length >= 4 ? 2 : 1;
+        if (hits.length < requiredHits) {
+          llmLastValidationReason = `Missing theme keywords: ${themeKeywords
+            .filter((k) => !combinedText.includes(k))
+            .slice(0, 3)
+            .join(", ")}`;
+          continue;
+        }
+      }
+      if (modeLabel === "B") {
+        const sourceTopicText =
+          expectedSubtype === "combo"
+            ? extractComboStatements(sourceText).join("\n")
+            : sourceText;
+        const generatedTopicText =
+          expectedSubtype === "combo"
+            ? extractComboStatements(
+                `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`
+              ).join("\n")
+            : `${parsed.passage ?? ""}\n${parsed.question}`;
+        const themeCheck = await semanticThemeCheck(sourceTopicText, generatedTopicText);
+        if (!themeCheck.ok) {
+          llmLastValidationReason = themeCheck.reason || "Semantic topic mismatch.";
+          continue;
+        }
+      }
       const correctChoice = parsed.choices[parsed.correctIndex];
       if (correctChoice && correctChoice.trim().toLowerCase() === sourceCorrect.toLowerCase()) {
         llmLastValidationReason = "Correct answer reused from source.";
@@ -620,15 +680,16 @@ app.post("/generate/mc", async (req, res) => {
       const jaccard = tokenJaccard(sourceCombined, combined);
       llmLastSim = sim;
       llmLastJaccard = jaccard;
-      if (sim >= minSim && sim <= maxSim && jaccard <= maxJaccard) {
-        return res.json({
-          item: parsed,
-          format: "multiple_choice",
-          similarity: sim,
-          jaccard,
-          similarityRange: { min: minSim, max: maxSim, maxJaccard },
-        });
-      }
+        if (sim >= minSim && sim <= maxSim && jaccard <= maxJaccard) {
+          return res.json({
+            item: parsed,
+            format: "multiple_choice",
+            similarity: sim,
+            jaccard,
+            similarityRange: { min: minSim, max: maxSim, maxJaccard },
+            mode: modeLabel,
+          });
+        }
       llmLastValidationReason = "Generated problem too similar to source.";
     }
 
@@ -877,6 +938,70 @@ function extractComboStatements(text: string): string[] {
   return lines.filter((l) => /^[ア-エ]．/.test(l));
 }
 
+function extractThemeKeywords(text: string): string[] {
+  const cleaned = text.replace(/\s+/g, " ");
+  const stoplist = new Set(["番号", "記述", "組合", "組み合わせ", "最適切", "選びなさい"]);
+  const japaneseTerms = [...cleaned.matchAll(/[\u4e00-\u9faf]{2,}/g)]
+    .map((m) => m[0])
+    .filter((t) => !stoplist.has(t));
+  if (japaneseTerms.length > 0) {
+    const uniq = Array.from(new Set(japaneseTerms));
+    return uniq.slice(0, 6);
+  }
+  const englishTerms = cleaned
+    .toLowerCase()
+    .match(/[a-z][a-z\-]{2,}/g);
+  if (!englishTerms) return [];
+  const uniq = Array.from(new Set(englishTerms));
+  return uniq.slice(0, 6);
+}
+
+async function semanticThemeCheck(
+  source: string,
+  generated: string
+): Promise<{ ok: boolean; reason?: string }> {
+  if (!generationProvider) return { ok: true };
+  const system = "You are a strict topic consistency judge. Answer only YES or NO.";
+  const prompt = [
+    "Do the two items test the SAME underlying concept/topic?",
+    "Answer ONLY with YES or NO.",
+    `Source:\n${source}`,
+    `Generated:\n${generated}`,
+  ].join("\n");
+  for (let i = 0; i < 2; i += 1) {
+    const raw = await generationProvider.generateText(prompt, system);
+    const answer = raw.trim().toUpperCase();
+    if (answer.startsWith("YES")) return { ok: true };
+    if (answer.startsWith("NO")) return { ok: false, reason: "Semantic topic mismatch." };
+  }
+  return { ok: true };
+}
+
+function questionContainsChoices(question: string) {
+  const lines = question.split(/\r?\n/).map((l) => l.trim());
+  return lines.some((l) => /^[\d０-９]+[．\.\)]/.test(l) || /[ア-エ]と[ア-エ]/.test(l));
+}
+
+function dedupeQuestionLines(question: string) {
+  const lines = question
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length <= 1) return question;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const line of lines) {
+    const key = line.replace(/\s+/g, "");
+    if (seen.has(key)) continue;
+    // If a generic combo instruction repeats, drop duplicates.
+    if (line.includes("正しいものの組合せ") && out.some((l) => l.includes("正しいものの組合せ"))) {
+      continue;
+    }
+    seen.add(key);
+    out.push(line);
+  }
+  return out.join("\n");
+}
 function detectJapaneseCombinationStyle(sourceText: string) {
   const hasStatements = /[ア-エ]．/.test(sourceText);
   const hasNumbered = /[1-9１-９]+．/.test(sourceText);
