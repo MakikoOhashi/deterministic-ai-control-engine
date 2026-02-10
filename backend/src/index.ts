@@ -40,6 +40,16 @@ type MultipleChoiceItem = {
   subtype?: "combo" | "standard";
 };
 
+type StructureItem = {
+  label: string;
+  type: "principle" | "exception" | "procedure" | "sanction";
+  actor: string;
+  action: string;
+  condition: string;
+  object: string;
+  numeric: string[];
+};
+
 const app = express();
 app.use(express.json());
 app.use((_req, res, next) => {
@@ -583,6 +593,10 @@ app.post("/generate/mc", async (req, res) => {
         : sourceText;
     const themeKeywords = modeLabel === "B" ? extractThemeKeywords(themeSource) : [];
     const choiceIntent = modeLabel === "B" ? await extractChoiceIntent(sourceText) : null;
+    const sourceStructure =
+      modeLabel === "B" && expectedSubtype === "combo"
+        ? await extractStructureItems(sourceStatements)
+        : null;
     const candidateCount = modeLabel === "B" && expectedSubtype === "combo" ? 3 : modeLabel === "B" ? 2 : 1;
     let sourceCombined =
       expectedSubtype === "combo"
@@ -612,6 +626,11 @@ app.post("/generate/mc", async (req, res) => {
         ? `Correct concept: ${choiceIntent.concept}. Use distractor patterns: ${choiceIntent.patterns.join(
             ", "
           )}.`
+        : "",
+      modeLabel === "B" && sourceStructure
+        ? `Preserve this structure per statement (type and numeric constraints must match): ${JSON.stringify(
+            sourceStructure
+          )}`
         : "",
       useComboStyle
         ? "For combo format, set passage to null. Put the instruction line and the ア〜エ statements in the question field only. Do NOT include any long explanatory passage."
@@ -703,6 +722,10 @@ app.post("/generate/mc", async (req, res) => {
           if (statements.length < (statementLabels.length || 4)) continue;
           if (isComboTooSimilar(sourceStatements, statements)) continue;
           if (!comboHasNovelTerms(sourceStatements, statements, 2)) continue;
+          if (modeLabel === "B" && sourceStructure) {
+            const generatedStructure = await extractStructureItems(statements);
+            if (generatedStructure && !validateStructureMatch(sourceStructure, generatedStructure)) continue;
+          }
         }
         if (modeLabel === "B" && themeKeywords.length) {
           const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
@@ -1049,6 +1072,17 @@ function extractJsonObject<T>(text: string): T | null {
   }
 }
 
+function extractJsonArray<T>(text: string): T[] | null {
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1)) as T[];
+  } catch {
+    return null;
+  }
+}
+
 function normalizeChoice(choice: string) {
   return choice
     .replace(/^\s*[\d０-９]+[．\.\)\:]\s*/i, "")
@@ -1134,6 +1168,94 @@ function extractThemeKeywords(text: string): string[] {
 function extractJapaneseKanjiTokens(text: string): string[] {
   const tokens = [...text.matchAll(/[\u4e00-\u9faf]{2,}/g)].map((m) => m[0]);
   return Array.from(new Set(tokens));
+}
+
+function normalizeDigits(text: string) {
+  return text.replace(/[０-９]/g, (d) => String(d.charCodeAt(0) - 0xff10));
+}
+
+function extractNumericTokens(text: string): string[] {
+  const normalized = normalizeDigits(text);
+  const matches = normalized.match(/\d+/g);
+  return matches ? Array.from(new Set(matches)) : [];
+}
+
+function normalizeStructureType(raw: string | undefined): StructureItem["type"] {
+  const value = (raw || "").toLowerCase();
+  if (value.includes("exception") || /例外|ただし/.test(raw || "")) return "exception";
+  if (value.includes("procedure") || /手続|通知|指定|届出/.test(raw || "")) return "procedure";
+  if (value.includes("sanction") || /罰|制裁|過料|懲戒|処分/.test(raw || "")) return "sanction";
+  return "principle";
+}
+
+function structureFromStatement(label: string, statement: string): StructureItem {
+  const numeric = extractNumericTokens(statement);
+  const type = normalizeStructureType(
+    /ただし/.test(statement)
+      ? "exception"
+      : /手続|通知|指定|届出/.test(statement)
+      ? "procedure"
+      : /罰|制裁|過料|懲戒|処分/.test(statement)
+      ? "sanction"
+      : "principle"
+  );
+  return {
+    label,
+    type,
+    actor: "",
+    action: "",
+    condition: "",
+    object: "",
+    numeric,
+  };
+}
+
+async function extractStructureItems(statements: string[]): Promise<StructureItem[] | null> {
+  if (!generationProvider) return null;
+  const labeled = statements.map((s, idx) => `${idx + 1}. ${s}`).join("\n");
+  const system = "You extract legal structure. Return ONLY JSON array.";
+  const prompt = [
+    "Extract a structure item per statement.",
+    "Return JSON array of items with fields:",
+    'label, type (principle|exception|procedure|sanction), actor, action, condition, object, numeric (array of numbers as strings).',
+    "Use label as the original statement label (e.g., ア, イ, ウ, エ).",
+    `Statements:\n${labeled}`,
+  ].join("\n");
+  const raw = await generationProvider.generateText(prompt, system);
+  const parsed = extractJsonArray<StructureItem>(raw);
+  if (!parsed || parsed.length === 0) return null;
+  return parsed.map((item, idx) => {
+    const statement = statements[idx] || "";
+    const numeric = item.numeric && item.numeric.length ? item.numeric : extractNumericTokens(statement);
+    return {
+      label: item.label || String(idx + 1),
+      type: normalizeStructureType(item.type),
+      actor: item.actor || "",
+      action: item.action || "",
+      condition: item.condition || "",
+      object: item.object || "",
+      numeric,
+    };
+  });
+}
+
+function validateStructureMatch(
+  sourceItems: StructureItem[],
+  generatedItems: StructureItem[]
+): boolean {
+  if (sourceItems.length === 0 || generatedItems.length === 0) return true;
+  const len = Math.min(sourceItems.length, generatedItems.length);
+  for (let i = 0; i < len; i += 1) {
+    if (sourceItems[i].type !== generatedItems[i].type) return false;
+    if (sourceItems[i].numeric.length > 0) {
+      const srcNums = new Set(sourceItems[i].numeric);
+      const genNums = new Set(generatedItems[i].numeric);
+      for (const n of srcNums) {
+        if (!genNums.has(n)) return false;
+      }
+    }
+  }
+  return true;
 }
 
 function comboHasNovelTerms(
