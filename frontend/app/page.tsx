@@ -23,22 +23,6 @@ type OverallResponse = {
   weights: Weights;
 };
 
-type BaselineItem = {
-  text: string;
-  correct: string;
-  distractors: string[];
-  steps: number;
-};
-
-function shuffle<T>(arr: T[]): T[] {
-  const copy = [...arr];
-  for (let i = copy.length - 1; i > 0; i -= 1) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [copy[i], copy[j]] = [copy[j], copy[i]];
-  }
-  return copy;
-}
-
 export default function Home() {
   const apiBase = useMemo(
     () => process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001",
@@ -46,14 +30,13 @@ export default function Home() {
   );
 
   const [baselineSources, setBaselineSources] = useState(
-    "Yesterday, we went to the park, and it brought back so many childhood memories."
+    "Passage:\nUrban green spaces reduce heat and improve wellbeing, but funding remains limited.\n\nQuestion:\nWhat does the passage imply about funding for green spaces?\n\nChoices:\nA) It is adequate.\nB) It is limited.\nC) It is increasing rapidly.\nD) It is unrelated to wellbeing.\n\nAnswer: B"
   );
 
-  const [text, setText] = useState("");
-  const [correct, setCorrect] = useState("");
-  const [distractors, setDistractors] = useState<string[]>([]);
-  const [format, setFormat] = useState<string | null>(null);
-  const [blankAnswer, setBlankAnswer] = useState("");
+  const [passage, setPassage] = useState("");
+  const [question, setQuestion] = useState("");
+  const [choices, setChoices] = useState<string[]>([]);
+  const [correctIndex, setCorrectIndex] = useState<number | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
 
@@ -73,23 +56,11 @@ export default function Home() {
       .catch(() => setWeights(null));
   }, [apiBase]);
 
-  useEffect(() => {
-    fetch(`${apiBase}/config/baseline-sample`)
-      .then((res) => res.json())
-      .then((data) => {
-        const item = data.item as BaselineItem;
-        setText(item.text);
-        setCorrect(item.correct);
-        setDistractors(shuffle(item.distractors));
-      })
-      .catch(() => null);
-  }, [apiBase]);
-
   const handleSetTarget = async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${apiBase}/target/from-sources`, {
+      const res = await fetch(`${apiBase}/target/from-sources-mc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -116,12 +87,11 @@ export default function Home() {
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
-      setText("");
-      setCorrect("");
-      setDistractors([]);
-      setFormat(null);
+      setPassage("");
+      setQuestion("");
+      setChoices([]);
+      setCorrectIndex(null);
       setSelected(null);
-      setBlankAnswer("");
       return null;
     } finally {
       setLoading(false);
@@ -138,7 +108,7 @@ export default function Home() {
           .map((s) => s.trim())
           .filter(Boolean)[0] || "";
       const sourceText = firstSource;
-      const res = await fetch(`${apiBase}/generate/fill-blank`, {
+      const res = await fetch(`${apiBase}/generate/mc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sourceText, target: targetOverride ?? target }),
@@ -148,17 +118,15 @@ export default function Home() {
         throw new Error(err.error || "Request failed");
       }
       const data = (await res.json()) as {
-        item: { text: string; correct: string; distractors: string[]; steps: number };
-        format?: string;
+        item: { passage?: string | null; question: string; choices: string[]; correctIndex: number };
         similarity?: number;
       };
-      setText(data.item.text);
-      setCorrect(data.item.correct);
-      setDistractors(shuffle(data.item.distractors));
-      setFormat(data.format || null);
+      setPassage(data.item.passage || "");
+      setQuestion(data.item.question);
+      setChoices(data.item.choices);
+      setCorrectIndex(data.item.correctIndex);
       setSimilarity(typeof data.similarity === "number" ? data.similarity : null);
       setSelected(null);
-      setBlankAnswer("");
       setSubmitted(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -182,9 +150,13 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text,
-          correct,
-          distractors,
+          text: passage ? `${passage}\n\n${question}` : question,
+          correct:
+            correctIndex != null && choices[correctIndex] ? choices[correctIndex] : "",
+          distractors:
+            correctIndex != null
+              ? choices.filter((_, i) => i !== correctIndex)
+              : [],
           steps: 2,
         }),
       });
@@ -202,24 +174,9 @@ export default function Home() {
     }
   };
 
-  const isCorrect = submitted && selected === correct;
-  const hasBlank = format === "full_blank" || format === "prefix_blank" || /(_\s*){2,}/.test(text);
-  const prefixRegex = /([A-Za-z]+)\s*((?:_\s*){2,})/;
-  const fullBlankRegex = /(_\s*){2,}/;
-  const prefixMatch = prefixRegex.exec(text);
-  const prefix = prefixMatch ? prefixMatch[1] : "";
-  const blankCount = prefixMatch ? (prefixMatch[2].match(/_/g) || []).length : 0;
-  const isPrefixBlank = format === "prefix_blank" || (!!prefixMatch && blankCount > 0);
-  const userAnswer = (hasBlank ? blankAnswer : selected || "").trim().toLowerCase();
-  const correctLower = correct.toLowerCase();
-  const suffix = prefix ? correctLower.slice(prefix.length) : "";
-  const blankCorrect =
-    submitted &&
-    (userAnswer === correctLower ||
-      (isPrefixBlank &&
-        userAnswer === suffix &&
-        suffix.length === blankCount &&
-        correctLower === `${prefix.toLowerCase()}${userAnswer}`));
+  const correctChoice =
+    correctIndex != null && choices[correctIndex] ? choices[correctIndex] : "";
+  const isCorrect = submitted && selected === correctChoice;
 
   const hints = [
     target && result
@@ -263,58 +220,26 @@ export default function Home() {
 
             <div className="generated">
               <div className="generated-title">Generated Question</div>
-              {hasBlank ? (
-                <div className="generated-text">
-                  {(() => {
-                    const match = isPrefixBlank ? prefixMatch : fullBlankRegex.exec(text);
-                    if (!match || match.index == null) {
-                      return <span>{text || "—"}</span>;
-                    }
-                    const idx = match.index;
-                    const before = text.slice(0, idx);
-                    const after = text.slice(idx + match[0].length);
-                    const underscoreCount = (match[0].match(/_/g) || []).length;
-                    return (
-                      <>
-                        <span>{before}</span>
-                        {isPrefixBlank && prefix ? <span>{prefix}</span> : null}
-                        <input
-                          className="inline-blank"
-                          value={blankAnswer}
-                          onChange={(e) => setBlankAnswer(e.target.value)}
-                          placeholder={"_".repeat(Math.max(underscoreCount, 3))}
-                          maxLength={underscoreCount || undefined}
-                          size={Math.max(underscoreCount, 6)}
-                          autoComplete="off"
-                        />
-                        <span>{after}</span>
-                      </>
-                    );
-                  })()}
-                </div>
-              ) : (
-                <div className="generated-text">{text || "—"}</div>
-              )}
-              {!hasBlank ? (
-                <div className="options">
-                  {[correct, ...distractors].filter(Boolean).map((opt) => (
-                    <label key={opt} className="option">
-                      <input
-                        type="radio"
-                        name="answer"
-                        value={opt}
-                        checked={selected === opt}
-                        onChange={() => setSelected(opt)}
-                      />
-                      <span>{opt}</span>
-                    </label>
-                  ))}
-                </div>
-              ) : null}
+              {passage ? <div className="generated-text">{passage}</div> : null}
+              <div className="generated-text">{question || "—"}</div>
+              <div className="options">
+                {choices.filter(Boolean).map((opt) => (
+                  <label key={opt} className="option">
+                    <input
+                      type="radio"
+                      name="answer"
+                      value={opt}
+                      checked={selected === opt}
+                      onChange={() => setSelected(opt)}
+                    />
+                    <span>{opt}</span>
+                  </label>
+                ))}
+              </div>
               <div className="actions">
                 <button
                   onClick={() => setSubmitted(true)}
-                  disabled={hasBlank ? !blankAnswer : !selected}
+                  disabled={!selected}
                 >
                   Submit Answer
                 </button>
@@ -324,13 +249,7 @@ export default function Home() {
               </div>
               {submitted ? (
                 <div className={isCorrect ? "result good" : "result bad"}>
-                  {hasBlank
-                    ? blankCorrect
-                      ? "Correct"
-                      : `Correct answer: ${correct}`
-                    : isCorrect
-                    ? "Correct"
-                    : `Correct answer: ${correct}`}
+                  {isCorrect ? "Correct" : `Correct answer: ${correctChoice}`}
                 </div>
               ) : null}
             </div>

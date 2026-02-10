@@ -29,7 +29,15 @@ import { targetFromStructure } from "./services/structure-target.service.js";
 import { classifyFormat } from "./services/format-classifier.service.js";
 import { validateGenerated } from "./services/format-validator.service.js";
 import { cosineSimilarity } from "./utils/cosine.js";
+import { countWords } from "./utils/text-metrics.js";
 import { GeminiTextGenerationProvider } from "./providers/gemini.generate.provider.js";
+
+type MultipleChoiceItem = {
+  passage?: string | null;
+  question: string;
+  choices: string[];
+  correctIndex: number;
+};
 
 const app = express();
 app.use(express.json());
@@ -473,6 +481,182 @@ app.post("/generate/fill-blank", async (req, res) => {
   }
 });
 
+app.post("/generate/mc", async (req, res) => {
+  try {
+    const { sourceText, target } = req.body as {
+      sourceText: string;
+      target?: { L: number; S: number; A: number; R: number };
+    };
+    if (!sourceText || typeof sourceText !== "string") {
+      return res.status(400).json({ error: "sourceText is required." });
+    }
+    if (!generationProvider) {
+      return res.status(400).json({ error: "Generation provider not configured." });
+    }
+    const sourceItem = await parseMultipleChoice(sourceText);
+    const sourceCombined = normalizeForSimilarity(buildCombinedText(sourceItem));
+    const sourceVec = await embeddingProvider.embedText(sourceCombined, 8);
+    const sourceCorrect = sourceItem.choices[sourceItem.correctIndex] || "";
+
+    const minSim = 0.4;
+    const maxSim = 0.85;
+    const maxJaccard = 0.75;
+
+    const hasPassage = Boolean(sourceItem.passage && sourceItem.passage.trim());
+    const passageLength = hasPassage ? countWords(sourceItem.passage || "") : 0;
+    const passageHint = hasPassage
+      ? `Passage length: ${Math.max(60, passageLength - 15)}-${passageLength + 15} words.`
+      : "No passage. Only a question.";
+
+    const system =
+      "You generate inference multiple-choice questions. Return ONLY valid JSON.";
+    const prompt = [
+      "Create a NEW multiple-choice question that matches the input format.",
+      "Do NOT copy the source. Do NOT reuse any 3-word sequence.",
+      "Keep 4 choices with exactly 1 correct answer.",
+      "Question type: inference only.",
+      passageHint,
+      target
+        ? `Target profile (L/S/A/R): ${target.L.toFixed(2)}, ${target.S.toFixed(
+            2
+          )}, ${target.A.toFixed(2)}, ${target.R.toFixed(2)}.`
+        : "Target profile: not provided.",
+      "Return JSON: {\"passage\": string|null, \"question\": string, \"choices\": [string,string,string,string], \"correctIndex\": 0-3}",
+      "Choices must be plain text (no labels).",
+      `Source:\n${sourceText}`,
+    ].join("\n");
+
+    let llmAttempted = false;
+    let llmLastSim: number | null = null;
+    let llmLastJaccard: number | null = null;
+    let llmLastText: string | null = null;
+    let llmLastValidationReason: string | null = null;
+
+    for (let i = 0; i < 3; i += 1) {
+      llmAttempted = true;
+      const raw = await generationProvider.generateText(prompt, system);
+      llmLastText = raw;
+      const parsed = extractJsonObject<MultipleChoiceItem>(raw);
+      if (!parsed) {
+        llmLastValidationReason = "LLM response was not valid JSON.";
+        continue;
+      }
+      parsed.choices = parsed.choices.map(normalizeChoice);
+      const error = validateMultipleChoice(parsed);
+      if (error) {
+        llmLastValidationReason = error;
+        continue;
+      }
+      if (hasPassage && (!parsed.passage || !parsed.passage.trim())) {
+        llmLastValidationReason = "Missing passage.";
+        continue;
+      }
+      if (!hasPassage && parsed.passage && parsed.passage.trim().length > 0) {
+        parsed.passage = null;
+      }
+      const correctChoice = parsed.choices[parsed.correctIndex];
+      if (correctChoice && correctChoice.trim().toLowerCase() === sourceCorrect.toLowerCase()) {
+        llmLastValidationReason = "Correct answer reused from source.";
+        continue;
+      }
+      const combined = normalizeForSimilarity(buildCombinedText(parsed));
+      const candidateVec = await embeddingProvider.embedText(combined, 8);
+      const sim = cosineSimilarity(sourceVec, candidateVec);
+      const jaccard = tokenJaccard(sourceCombined, combined);
+      llmLastSim = sim;
+      llmLastJaccard = jaccard;
+      if (sim >= minSim && sim <= maxSim && jaccard <= maxJaccard) {
+        return res.json({
+          item: parsed,
+          format: "multiple_choice",
+          similarity: sim,
+          jaccard,
+          similarityRange: { min: minSim, max: maxSim, maxJaccard },
+        });
+      }
+      llmLastValidationReason = "Generated problem too similar to source.";
+    }
+
+    return res.status(422).json({
+      error: "Generated problem too similar to source. Please try again.",
+      similarityRange: { min: minSim, max: maxSim, maxJaccard },
+      debug: {
+        llmAttempted,
+        llmLastSim,
+        llmLastJaccard,
+        llmLastText,
+        llmLastValidationReason,
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post("/target/from-sources-mc", async (req, res) => {
+  try {
+    const { sourceTexts } = req.body as { sourceTexts: string[] };
+    if (!Array.isArray(sourceTexts)) {
+      return res.status(400).json({ error: "Expected { sourceTexts: string[] }" });
+    }
+    if (!generationProvider) {
+      return res.status(400).json({ error: "Generation provider not configured." });
+    }
+    const items = sourceTexts
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    if (items.length === 0) {
+      return res.status(400).json({ error: "sourceTexts must include at least one item." });
+    }
+
+    const Ls: number[] = [];
+    const Ss: number[] = [];
+    const As: number[] = [];
+    const Rs: number[] = [];
+
+    for (const src of items) {
+      const parsed = await parseMultipleChoice(src);
+      const combined = buildCombinedText(parsed);
+      const lexical = computeLexicalComplexity(combined);
+      const structural = computeStructuralComplexity(combined);
+      const correct = parsed.choices[parsed.correctIndex];
+      const distractors = parsed.choices.filter((_, i) => i !== parsed.correctIndex);
+      const correctVec = await embeddingProvider.embedText(correct, 8);
+      const distractorVecs = await embeddingProvider.embedTexts(distractors, 8);
+      const A = semanticAmbiguityA(correctVec, distractorVecs);
+      const R = normalizeReasoningDepth(2, 5);
+      Ls.push(lexical.L);
+      Ss.push(structural.S);
+      As.push(A);
+      Rs.push(R);
+    }
+
+    const count = items.length;
+    const mean = (values: number[]) => values.reduce((a, b) => a + b, 0) / values.length;
+    const std = (values: number[]) => {
+      if (values.length <= 1) return 0;
+      const m = mean(values);
+      const variance = mean(values.map((v) => (v - m) ** 2));
+      return Math.sqrt(variance);
+    };
+    const stability = count <= 1 ? "Low" : count === 2 ? "Medium" : "High";
+    const effectiveTolerance = count <= 1 ? 0.1 : count === 2 ? 0.07 : 0.05;
+
+    return res.json({
+      mean: { L: mean(Ls), S: mean(Ss), A: mean(As), R: mean(Rs) },
+      std: { L: std(Ls), S: std(Ss), A: std(As), R: std(Rs) },
+      count,
+      stability,
+      effectiveTolerance,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
 app.post("/target/from-sources", async (req, res) => {
   try {
     const { sourceTexts } = req.body as { sourceTexts: string[] };
@@ -560,4 +744,70 @@ function extractJson(text: string): { text: string; answer: string } | null {
   } catch {
     return null;
   }
+}
+
+function extractJsonObject<T>(text: string): T | null {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1)) as T;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeChoice(choice: string) {
+  return choice
+    .replace(/^\s*[A-D][\).:\-]\s*/i, "")
+    .replace(/^\s*[A-D]\s+/, "")
+    .trim();
+}
+
+function validateMultipleChoice(item: MultipleChoiceItem): string | null {
+  if (!item.question || typeof item.question !== "string") {
+    return "Missing question.";
+  }
+  if (!Array.isArray(item.choices) || item.choices.length !== 4) {
+    return "Expected exactly 4 choices.";
+  }
+  if (
+    typeof item.correctIndex !== "number" ||
+    item.correctIndex < 0 ||
+    item.correctIndex > 3
+  ) {
+    return "Invalid correctIndex.";
+  }
+  return null;
+}
+
+function buildCombinedText(item: MultipleChoiceItem) {
+  const passage = item.passage ? item.passage.trim() : "";
+  return passage ? `${passage}\n\n${item.question}` : item.question;
+}
+
+async function parseMultipleChoice(sourceText: string): Promise<MultipleChoiceItem> {
+  if (!generationProvider) {
+    throw new Error("Generation provider not configured.");
+  }
+  const system =
+    "You extract multiple-choice questions. Return ONLY valid JSON with strict fields.";
+  const prompt = [
+    "Parse the input into JSON:",
+    '{"passage": string|null, "question": string, "choices": [string,string,string,string], "correctIndex": 0-3}',
+    "Passage can be null if not present.",
+    "Normalize choices to plain text (no labels).",
+    "If correct choice is not explicit, infer the best answer.",
+    `Input:\n${sourceText}`,
+  ].join("\n");
+  for (let i = 0; i < 3; i += 1) {
+    const raw = await generationProvider.generateText(prompt, system);
+    const parsed = extractJsonObject<MultipleChoiceItem>(raw);
+    if (!parsed) continue;
+    parsed.choices = parsed.choices.map(normalizeChoice);
+    const error = validateMultipleChoice(parsed);
+    if (error) continue;
+    return parsed;
+  }
+  throw new Error("Failed to parse multiple-choice input.");
 }
