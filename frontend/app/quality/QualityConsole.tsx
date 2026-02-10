@@ -73,6 +73,7 @@ export default function QualityConsole(props: {
     distractors: number | null;
     choices: number | null;
   } | null;
+  choiceIntent?: { concept: string; patterns: string[] } | null;
   error?: string | null;
 }) {
   const {
@@ -83,6 +84,7 @@ export default function QualityConsole(props: {
     stability,
     similarity,
     similarityBreakdown,
+    choiceIntent,
     error,
   } = props;
 
@@ -165,6 +167,18 @@ export default function QualityConsole(props: {
                 <div></div>
               </div>
             ))}
+          </div>
+        ) : null}
+
+        {choiceIntent ? (
+          <div className="summary-card" style={{ marginTop: 12 }}>
+            <div className="label">Choice Intent</div>
+            <div className="value" style={{ fontSize: 14 }}>
+              {choiceIntent.concept}
+            </div>
+            <div className="meta">
+              {choiceIntent.patterns.join(" • ")}
+            </div>
           </div>
         ) : null}
 
