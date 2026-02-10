@@ -31,10 +31,10 @@ export class GeminiTextGenerationProvider implements TextGenerationProvider {
               parts: [{ text: prompt }],
             },
           ],
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 120,
-          },
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 300,
+        },
         }),
       });
       if (res.ok) {

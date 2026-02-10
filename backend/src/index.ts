@@ -37,6 +37,7 @@ type MultipleChoiceItem = {
   question: string;
   choices: string[];
   correctIndex: number;
+  subtype?: "combo" | "standard";
 };
 
 const app = express();
@@ -494,9 +495,6 @@ app.post("/generate/mc", async (req, res) => {
       return res.status(400).json({ error: "Generation provider not configured." });
     }
     const sourceItem = await parseMultipleChoice(sourceText);
-    const sourceCombined = normalizeForSimilarity(buildCombinedText(sourceItem));
-    const sourceVec = await embeddingProvider.embedText(sourceCombined, 8);
-    const sourceCorrect = sourceItem.choices[sourceItem.correctIndex] || "";
 
     const minSim = 0.4;
     const maxSim = 0.85;
@@ -504,25 +502,46 @@ app.post("/generate/mc", async (req, res) => {
 
     const hasPassage = Boolean(sourceItem.passage && sourceItem.passage.trim());
     const passageLength = hasPassage ? countWords(sourceItem.passage || "") : 0;
+    const choiceCount = sourceItem.choices.length;
     const passageHint = hasPassage
       ? `Passage length: ${Math.max(60, passageLength - 15)}-${passageLength + 15} words.`
       : "No passage. Only a question.";
 
     const system =
       "You generate inference multiple-choice questions. Return ONLY valid JSON.";
+    const useComboStyle = detectJapaneseCombinationStyle(sourceText);
+    const statementLabels = useComboStyle ? extractJapaneseStatementLabels(sourceText) : [];
+    const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
+    let sourceCombined =
+      expectedSubtype === "combo"
+        ? normalizeForSimilarity(extractStatementText(sourceText))
+        : normalizeForSimilarity(buildCombinedText(sourceItem));
+    if (!sourceCombined.trim()) {
+      sourceCombined = normalizeForSimilarity(buildCombinedText(sourceItem));
+    }
+    const sourceVec = await embeddingProvider.embedText(sourceCombined, 8);
+    const sourceCorrect = sourceItem.choices[sourceItem.correctIndex] || "";
     const prompt = [
       "Create a NEW multiple-choice question that matches the input format.",
       "Do NOT copy the source. Do NOT reuse any 3-word sequence.",
-      "Keep 4 choices with exactly 1 correct answer.",
+      `Keep exactly ${choiceCount} choices with exactly 1 correct answer.`,
+      `Your choices array MUST have exactly ${choiceCount} items.`,
       "Question type: inference only.",
+      "Use the same language as the source.",
+      useComboStyle
+        ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source.`
+        : "Match the overall style and structure of the source.",
+      "Return ONLY valid JSON in a single line. No markdown, no code fences.",
       passageHint,
       target
         ? `Target profile (L/S/A/R): ${target.L.toFixed(2)}, ${target.S.toFixed(
             2
           )}, ${target.A.toFixed(2)}, ${target.R.toFixed(2)}.`
         : "Target profile: not provided.",
-      "Return JSON: {\"passage\": string|null, \"question\": string, \"choices\": [string,string,string,string], \"correctIndex\": 0-3}",
-      "Choices must be plain text (no labels).",
+      "Return JSON: {\"passage\": string|null, \"question\": string, \"choices\": [string,...], \"correctIndex\": 0-(choices.length-1)}",
+      useComboStyle
+        ? "Choices may include numbering like '1. アイ' if that matches the source."
+        : "Choices must be plain text (no labels).",
       `Source:\n${sourceText}`,
     ].join("\n");
 
@@ -532,7 +551,7 @@ app.post("/generate/mc", async (req, res) => {
     let llmLastText: string | null = null;
     let llmLastValidationReason: string | null = null;
 
-    for (let i = 0; i < 3; i += 1) {
+    for (let i = 0; i < 5; i += 1) {
       llmAttempted = true;
       const raw = await generationProvider.generateText(prompt, system);
       llmLastText = raw;
@@ -542,6 +561,14 @@ app.post("/generate/mc", async (req, res) => {
         continue;
       }
       parsed.choices = parsed.choices.map(normalizeChoice);
+      if (parsed.choices.length !== choiceCount) {
+        llmLastValidationReason = `Choice count does not match source. expected=${choiceCount} actual=${parsed.choices.length}`;
+        continue;
+      }
+      if (expectedSubtype === "combo" && !detectComboChoices(parsed.choices)) {
+        llmLastValidationReason = "Choices are not in combination format (アイ/アウ...).";
+        continue;
+      }
       const error = validateMultipleChoice(parsed);
       if (error) {
         llmLastValidationReason = error;
@@ -559,7 +586,17 @@ app.post("/generate/mc", async (req, res) => {
         llmLastValidationReason = "Correct answer reused from source.";
         continue;
       }
-      const combined = normalizeForSimilarity(buildCombinedText(parsed));
+      let combined =
+        expectedSubtype === "combo"
+          ? normalizeForSimilarity(
+              extractStatementText(
+                `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`
+              )
+            )
+          : normalizeForSimilarity(buildCombinedText(parsed));
+      if (!combined.trim()) {
+        combined = normalizeForSimilarity(buildCombinedText(parsed));
+      }
       const candidateVec = await embeddingProvider.embedText(combined, 8);
       const sim = cosineSimilarity(sourceVec, candidateVec);
       const jaccard = tokenJaccard(sourceCombined, combined);
@@ -720,9 +757,27 @@ function softenSimilarity(text: string): string {
   return out;
 }
 
+function isJapanese(text: string) {
+  return /[\u3040-\u30ff\u4e00-\u9faf]/.test(text);
+}
+
+function japaneseNgrams(text: string, n = 2) {
+  const cleaned = text.replace(/\s+/g, "");
+  if (cleaned.length < n) return cleaned ? [cleaned] : [];
+  const grams: string[] = [];
+  for (let i = 0; i <= cleaned.length - n; i += 1) {
+    grams.push(cleaned.slice(i, i + n));
+  }
+  return grams;
+}
+
 function tokenJaccard(a: string, b: string): number {
-  const tokensA = new Set(a.split(/\s+/).filter(Boolean));
-  const tokensB = new Set(b.split(/\s+/).filter(Boolean));
+  const tokensA = new Set(
+    isJapanese(a) ? japaneseNgrams(a, 2) : a.split(/\s+/).filter(Boolean)
+  );
+  const tokensB = new Set(
+    isJapanese(b) ? japaneseNgrams(b, 2) : b.split(/\s+/).filter(Boolean)
+  );
   const union = new Set([...tokensA, ...tokensB]);
   let inter = 0;
   for (const t of tokensA) {
@@ -759,6 +814,7 @@ function extractJsonObject<T>(text: string): T | null {
 
 function normalizeChoice(choice: string) {
   return choice
+    .replace(/^\s*[\d０-９]+[．\.\)\:]\s*/i, "")
     .replace(/^\s*[A-D][\).:\-]\s*/i, "")
     .replace(/^\s*[A-D]\s+/, "")
     .trim();
@@ -768,13 +824,13 @@ function validateMultipleChoice(item: MultipleChoiceItem): string | null {
   if (!item.question || typeof item.question !== "string") {
     return "Missing question.";
   }
-  if (!Array.isArray(item.choices) || item.choices.length !== 4) {
-    return "Expected exactly 4 choices.";
+  if (!Array.isArray(item.choices) || item.choices.length < 2 || item.choices.length > 8) {
+    return "Expected between 2 and 8 choices.";
   }
   if (
     typeof item.correctIndex !== "number" ||
     item.correctIndex < 0 ||
-    item.correctIndex > 3
+    item.correctIndex >= item.choices.length
   ) {
     return "Invalid correctIndex.";
   }
@@ -786,7 +842,139 @@ function buildCombinedText(item: MultipleChoiceItem) {
   return passage ? `${passage}\n\n${item.question}` : item.question;
 }
 
+function extractStatementText(text: string) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const statementLines = lines.filter((l) => /^[ア-エ]．/.test(l));
+  return statementLines.join("\n");
+}
+
+function detectJapaneseCombinationStyle(sourceText: string) {
+  const hasStatements = /[ア-エ]．/.test(sourceText);
+  const hasNumbered = /[1-9１-９]+．/.test(sourceText);
+  const hasCombo = /[アイウエ]{2,}/.test(sourceText);
+  return hasStatements && hasNumbered && hasCombo;
+}
+
+function extractJapaneseStatementLabels(sourceText: string) {
+  const labels: string[] = [];
+  for (const line of sourceText.split(/\r?\n/)) {
+    const match = line.match(/^([ア-エ])．/);
+    if (match) labels.push(match[1]);
+  }
+  return labels.length > 0 ? Array.from(new Set(labels)) : [];
+}
+
+function detectComboChoices(choices: string[]) {
+  return choices.every((c) => /[ア-エ](?:と|・)?[ア-エ]/.test(c));
+}
+
+function splitInlineChoices(line: string): string[] | null {
+  const matches = [...line.matchAll(/(?:^|\s)([\d０-９]+)[．\.\)]\s*([^\s]+)/g)];
+  if (matches.length < 2) return null;
+  return matches.map((m) => `${m[1]}. ${m[2]}`);
+}
+
+function tryParseMultipleChoiceHeuristic(sourceText: string): MultipleChoiceItem | null {
+  const rawLines = sourceText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (rawLines.length < 3) return null;
+
+  const inlineChoices = rawLines
+    .map((line) => splitInlineChoices(line))
+    .find((choices) => choices && choices.length >= 2);
+  if (inlineChoices) {
+    const idx = rawLines.findIndex((l) => splitInlineChoices(l));
+    let questionLine = rawLines[idx - 1];
+    if (!questionLine) return null;
+    const looksLikeStatement = /^[ア-エ]．/.test(questionLine);
+    const firstLine = rawLines[0] || "";
+    let passageLines = rawLines.slice(0, Math.max(0, idx - 1));
+    if (looksLikeStatement && /選びなさい|問|次の記述/.test(firstLine)) {
+      questionLine = firstLine;
+      passageLines = rawLines.slice(1, Math.max(1, idx - 1));
+    }
+    const item: MultipleChoiceItem = {
+      passage: passageLines.length ? passageLines.join("\n") : null,
+      question: questionLine,
+      choices: inlineChoices.map(normalizeChoice),
+      correctIndex: 0,
+      subtype: "combo",
+    };
+    const error = validateMultipleChoice(item);
+    return error ? null : item;
+  }
+
+  const lines = [...rawLines];
+
+  const answerLineIndex = lines.findIndex((l) => /^answer\s*:/i.test(l));
+  let explicitAnswer: string | null = null;
+  if (answerLineIndex >= 0) {
+    explicitAnswer = lines[answerLineIndex].replace(/^answer\s*:\s*/i, "").trim();
+    lines.splice(answerLineIndex, 1);
+  }
+
+  const choicePattern = /^\s*[\d０-９]+[．\.\)]|^\s*[A-D][\).:\-]/i;
+  let choiceStart = lines.length - 1;
+  while (choiceStart >= 0 && choicePattern.test(lines[choiceStart])) {
+    choiceStart -= 1;
+  }
+  const choiceLines = lines.slice(choiceStart + 1);
+  const questionLine = lines[choiceStart];
+  if (!questionLine || choiceLines.length < 2) return null;
+
+  const normalizedChoices = choiceLines.map(normalizeChoice);
+  const question = questionLine.replace(/^question\s*:\s*/i, "").trim();
+  const passageLines = lines.slice(0, Math.max(0, lines.length - 5));
+  const passage = passageLines.length
+    ? passageLines.join("\n").replace(/^passage\s*:\s*/i, "").trim()
+    : null;
+
+  if (question.length < 6) return null;
+
+  let correctIndex = 0;
+  if (explicitAnswer) {
+    const numeric = explicitAnswer.replace(/[^\d０-９]/g, "");
+    if (numeric) {
+      const normalizedNumber = Number(numeric.replace(/[０-９]/g, (d) => String(d.charCodeAt(0) - 0xff10)));
+      if (!Number.isNaN(normalizedNumber) && normalizedNumber >= 1) {
+        const idx = normalizedNumber - 1;
+        if (idx >= 0 && idx < normalizedChoices.length) {
+          correctIndex = idx;
+          return {
+            passage: passage && passage.length > 0 ? passage : null,
+            question,
+            choices: normalizedChoices,
+            correctIndex,
+          };
+        }
+      }
+    }
+    const normalizedAnswer = normalizeChoice(explicitAnswer).toLowerCase();
+    const idx = normalizedChoices.findIndex(
+      (c) => normalizeChoice(c).toLowerCase() === normalizedAnswer
+    );
+    if (idx >= 0) correctIndex = idx;
+  }
+
+  const item: MultipleChoiceItem = {
+    passage: passage && passage.length > 0 ? passage : null,
+    question,
+    choices: normalizedChoices,
+    correctIndex,
+    subtype: detectComboChoices(normalizedChoices) ? "combo" : "standard",
+  };
+  const error = validateMultipleChoice(item);
+  return error ? null : item;
+}
+
 async function parseMultipleChoice(sourceText: string): Promise<MultipleChoiceItem> {
+  const heuristic = tryParseMultipleChoiceHeuristic(sourceText);
+  if (heuristic) return heuristic;
   if (!generationProvider) {
     throw new Error("Generation provider not configured.");
   }
@@ -794,8 +982,10 @@ async function parseMultipleChoice(sourceText: string): Promise<MultipleChoiceIt
     "You extract multiple-choice questions. Return ONLY valid JSON with strict fields.";
   const prompt = [
     "Parse the input into JSON:",
-    '{"passage": string|null, "question": string, "choices": [string,string,string,string], "correctIndex": 0-3}',
+    '{"passage": string|null, "question": string, "choices": [string,...], "correctIndex": 0-(choices.length-1)}',
     "Passage can be null if not present.",
+    "The input may NOT include labels like 'Passage:' or 'Question:'. Infer structure from order.",
+    "If there are 4 short lines at the end, treat them as choices.",
     "Normalize choices to plain text (no labels).",
     "If correct choice is not explicit, infer the best answer.",
     `Input:\n${sourceText}`,
