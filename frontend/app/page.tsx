@@ -23,6 +23,14 @@ type OverallResponse = {
   weights: Weights;
 };
 
+type SimilarityBreakdown = {
+  passage: number | null;
+  question: number | null;
+  correctChoice: number | null;
+  distractors: number | null;
+  choices: number | null;
+};
+
 export default function Home() {
   const apiBase = useMemo(
     () => process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001",
@@ -48,6 +56,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [similarity, setSimilarity] = useState<number | null>(null);
+  const [similarityBreakdown, setSimilarityBreakdown] = useState<SimilarityBreakdown | null>(null);
   const [mode, setMode] = useState<"A" | "B">("A");
 
   useEffect(() => {
@@ -125,18 +134,21 @@ export default function Home() {
       const data = (await res.json()) as {
         item: { passage?: string | null; question: string; choices: string[]; correctIndex: number };
         similarity?: number;
+        similarityBreakdown?: SimilarityBreakdown;
       };
       setPassage(data.item.passage || "");
       setQuestion(data.item.question);
       setChoices(data.item.choices);
       setCorrectIndex(data.item.correctIndex);
       setSimilarity(typeof data.similarity === "number" ? data.similarity : null);
+      setSimilarityBreakdown(data.similarityBreakdown ?? null);
       setSelected(null);
       setSubmitted(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
       setSimilarity(null);
+      setSimilarityBreakdown(null);
     } finally {
       setLoading(false);
     }
@@ -293,6 +305,7 @@ export default function Home() {
         effectiveTolerance={effectiveTolerance}
         stability={targetStability}
         similarity={similarity}
+        similarityBreakdown={similarityBreakdown}
         error={error}
       />
     </main>

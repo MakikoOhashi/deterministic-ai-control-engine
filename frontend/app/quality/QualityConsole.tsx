@@ -66,9 +66,25 @@ export default function QualityConsole(props: {
   effectiveTolerance: number;
   stability: string | null;
   similarity?: number | null;
+  similarityBreakdown?: {
+    passage: number | null;
+    question: number | null;
+    correctChoice: number | null;
+    distractors: number | null;
+    choices: number | null;
+  } | null;
   error?: string | null;
 }) {
-  const { result, target, weights, effectiveTolerance, stability, similarity, error } = props;
+  const {
+    result,
+    target,
+    weights,
+    effectiveTolerance,
+    stability,
+    similarity,
+    similarityBreakdown,
+    error,
+  } = props;
 
   const current = result?.components || { L: 0, S: 0, A: 0, R: 0 };
   const targetProfile = target || { L: 0, S: 0, A: 0, R: 0 };
@@ -124,6 +140,33 @@ export default function QualityConsole(props: {
             </div>
           </div>
         </div>
+
+        {similarityBreakdown ? (
+          <div className="table compact">
+            <div className="row header">
+              <div>Similarity</div>
+              <div>Value</div>
+              <div></div>
+              <div></div>
+              <div></div>
+            </div>
+            {[
+              { key: "Passage", value: similarityBreakdown.passage },
+              { key: "Question", value: similarityBreakdown.question },
+              { key: "Correct", value: similarityBreakdown.correctChoice },
+              { key: "Distractors", value: similarityBreakdown.distractors },
+              { key: "Choices", value: similarityBreakdown.choices },
+            ].map((row) => (
+              <div className="row" key={row.key}>
+                <div className="axis">{row.key}</div>
+                <div>{typeof row.value === "number" ? row.value.toFixed(3) : "--"}</div>
+                <div></div>
+                <div></div>
+                <div></div>
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         <div className="table compact">
           <div className="row header">

@@ -526,6 +526,7 @@ app.post("/generate/mc", async (req, res) => {
         ? extractComboStatements(sourceText).join("\n")
         : sourceText;
     const themeKeywords = modeLabel === "B" ? extractThemeKeywords(themeSource) : [];
+    const choiceIntent = modeLabel === "B" ? await extractChoiceIntent(sourceText) : null;
     let sourceCombined =
       expectedSubtype === "combo"
         ? normalizeForSimilarity(extractStatementText(sourceText))
@@ -549,6 +550,11 @@ app.post("/generate/mc", async (req, res) => {
         : modeLabel === "B"
         ? "Match the overall style and structure of the source. Preserve the same topic and intent, but rephrase the content."
         : "Match the overall style and structure of the source.",
+      modeLabel === "B" && choiceIntent
+        ? `Correct concept: ${choiceIntent.concept}. Use distractor patterns: ${choiceIntent.patterns.join(
+            ", "
+          )}.`
+        : "",
       useComboStyle
         ? "For combo format, set passage to null. Put the instruction line and the ア〜エ statements in the question field only. Do NOT include any long explanatory passage."
         : "",
@@ -681,13 +687,44 @@ app.post("/generate/mc", async (req, res) => {
       llmLastSim = sim;
       llmLastJaccard = jaccard;
         if (sim >= minSim && sim <= maxSim && jaccard <= maxJaccard) {
+          const textSim = async (a: string | null | undefined, b: string | null | undefined) => {
+            if (!a || !b) return null;
+            const aVec = await embeddingProvider.embedText(normalizeForSimilarity(a), 8);
+            const bVec = await embeddingProvider.embedText(normalizeForSimilarity(b), 8);
+            return cosineSimilarity(aVec, bVec);
+          };
+          const passageSim = await textSim(sourceItem.passage, parsed.passage);
+          const questionSim = await textSim(
+            stripGenericQuestionLines(sourceItem.question),
+            stripGenericQuestionLines(parsed.question)
+          );
+          const correctChoiceSim = await textSim(
+            sourceItem.choices[sourceItem.correctIndex],
+            parsed.choices[parsed.correctIndex]
+          );
+          const distractorSim = await textSim(
+            sourceItem.choices.filter((_c, i) => i !== sourceItem.correctIndex).join(" "),
+            parsed.choices.filter((_c, i) => i !== parsed.correctIndex).join(" ")
+          );
+          const overallChoicesSim =
+            correctChoiceSim != null && distractorSim != null
+              ? (correctChoiceSim + distractorSim) / 2
+              : correctChoiceSim ?? distractorSim;
           return res.json({
             item: parsed,
             format: "multiple_choice",
             similarity: sim,
             jaccard,
             similarityRange: { min: minSim, max: maxSim, maxJaccard },
+            similarityBreakdown: {
+              passage: passageSim,
+              question: questionSim,
+              correctChoice: correctChoiceSim,
+              distractors: distractorSim,
+              choices: overallChoicesSim,
+            },
             mode: modeLabel,
+            choiceIntent: choiceIntent ?? undefined,
           });
         }
       llmLastValidationReason = "Generated problem too similar to source.";
@@ -977,6 +1014,29 @@ async function semanticThemeCheck(
   return { ok: true };
 }
 
+async function extractChoiceIntent(
+  sourceText: string
+): Promise<{ concept: string; patterns: string[] } | null> {
+  if (!generationProvider) return null;
+  const system = "You summarize answer intent and distractor patterns. Return ONLY valid JSON.";
+  const prompt = [
+    "Analyze the question and choices.",
+    "Return JSON: {\"concept\":\"...\",\"patterns\":[\"condition missing\",\"logical flip\",\"overgeneralization\"]}",
+    "Use ONLY these three pattern labels.",
+    `Source:\n${sourceText}`,
+  ].join("\n");
+  const raw = await generationProvider.generateText(prompt, system);
+  const parsed = extractJsonObject<{ concept?: string; patterns?: string[] }>(raw);
+  if (!parsed || !parsed.concept || !Array.isArray(parsed.patterns)) return null;
+  const patterns = parsed.patterns
+    .filter((p) =>
+      ["condition missing", "logical flip", "overgeneralization"].includes(p)
+    )
+    .slice(0, 3);
+  if (patterns.length === 0) return null;
+  return { concept: parsed.concept, patterns };
+}
+
 function questionContainsChoices(question: string) {
   const lines = question.split(/\r?\n/).map((l) => l.trim());
   return lines.some((l) => /^[\d０-９]+[．\.\)]/.test(l) || /[ア-エ]と[ア-エ]/.test(l));
@@ -1001,6 +1061,28 @@ function dedupeQuestionLines(question: string) {
     out.push(line);
   }
   return out.join("\n");
+}
+
+function stripGenericQuestionLines(question: string) {
+  const lines = question
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const filtered = lines.filter(
+    (line) =>
+      !/正しいものの組合せ|最も適切|番号|選びなさい|次の記述/.test(line)
+  );
+  return filtered.join("\n");
+}
+
+function averageVector(vectors: number[][]): number[] {
+  if (vectors.length === 0) return [];
+  const dim = vectors[0].length;
+  const sums = new Array<number>(dim).fill(0);
+  for (const vec of vectors) {
+    for (let i = 0; i < dim; i += 1) sums[i] += vec[i];
+  }
+  return sums.map((v) => v / vectors.length);
 }
 function detectJapaneseCombinationStyle(sourceText: string) {
   const hasStatements = /[ア-エ]．/.test(sourceText);
