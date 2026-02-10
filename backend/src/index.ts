@@ -500,12 +500,13 @@ app.post("/generate/mc", async (req, res) => {
     const useComboStyle = detectJapaneseCombinationStyle(sourceText);
     const statementLabels = useComboStyle ? extractJapaneseStatementLabels(sourceText) : [];
     const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
+    const sourceStatements = useComboStyle ? extractComboStatements(sourceText) : [];
     const minSim = 0.4;
     const modeLabel = mode === "B" ? "B" : "A";
     const maxSim =
       modeLabel === "B"
         ? expectedSubtype === "combo"
-          ? 0.9
+          ? 0.97
           : 0.9
         : expectedSubtype === "combo"
         ? 0.92
@@ -582,7 +583,7 @@ app.post("/generate/mc", async (req, res) => {
         : sourceText;
     const themeKeywords = modeLabel === "B" ? extractThemeKeywords(themeSource) : [];
     const choiceIntent = modeLabel === "B" ? await extractChoiceIntent(sourceText) : null;
-    const candidateCount = modeLabel === "B" ? 2 : 1;
+    const candidateCount = modeLabel === "B" && expectedSubtype === "combo" ? 3 : modeLabel === "B" ? 2 : 1;
     let sourceCombined =
       expectedSubtype === "combo"
         ? normalizeForSimilarity(extractStatementText(sourceText))
@@ -602,7 +603,7 @@ app.post("/generate/mc", async (req, res) => {
       "Use the same language as the source.",
       useComboStyle
         ? modeLabel === "B"
-          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same audit topic and concept, but DO NOT paraphrase line-by-line. Change structure and conditions (e.g., actor, scope, period) while staying within the same legal topic. Avoid reusing sentence order or clause structure from the source.`
+          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same audit topic and concept, but DO NOT paraphrase line-by-line. Change structure and conditions (e.g., actor, scope, period). At least two statements must introduce different specific conditions and include new domain terms not present in the source. Do NOT reuse numeric values or exception phrasing from the source. Avoid reusing sentence order or clause structure from the source.`
           : `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Do NOT paraphrase the original statements. Replace them with different audit topics (e.g., internal control, going concern, subsequent events, materiality, audit risk). Each statement must introduce a different concept from the source.`
         : modeLabel === "B"
         ? "Match the overall style and structure of the source. Preserve the same topic and intent, but rephrase the content."
@@ -642,7 +643,7 @@ app.post("/generate/mc", async (req, res) => {
     let llmLastText: string | null = null;
     let llmLastValidationReason: string | null = null;
 
-    const maxAttempts = modeLabel === "B" ? 2 : 1;
+    const maxAttempts = modeLabel === "B" && expectedSubtype === "combo" ? 3 : modeLabel === "B" ? 2 : 1;
     let best: {
       item: MultipleChoiceItem;
       sim: number;
@@ -700,6 +701,8 @@ app.post("/generate/mc", async (req, res) => {
           const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
           const statements = extractComboStatements(combinedText);
           if (statements.length < (statementLabels.length || 4)) continue;
+          if (isComboTooSimilar(sourceStatements, statements)) continue;
+          if (!comboHasNovelTerms(sourceStatements, statements, 2)) continue;
         }
         if (modeLabel === "B" && themeKeywords.length) {
           const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
@@ -1093,6 +1096,23 @@ function extractComboStatements(text: string): string[] {
   return lines.filter((l) => /^[ア-エ]．/.test(l));
 }
 
+function isComboTooSimilar(sourceStatements: string[], generatedStatements: string[]) {
+  if (sourceStatements.length === 0 || generatedStatements.length === 0) return false;
+  const normalizedSource = sourceStatements.map((s) => normalizeForSimilarity(s));
+  const normalizedGenerated = generatedStatements.map((s) => normalizeForSimilarity(s));
+  let highOverlap = 0;
+  for (const gen of normalizedGenerated) {
+    let max = 0;
+    for (const src of normalizedSource) {
+      const j = tokenJaccard(src, gen);
+      if (j > max) max = j;
+    }
+    if (max >= 0.7) highOverlap += 1;
+  }
+  const rejectThreshold = Math.max(3, Math.ceil(normalizedGenerated.length / 2) + 1);
+  return highOverlap >= rejectThreshold;
+}
+
 function extractThemeKeywords(text: string): string[] {
   const cleaned = text.replace(/\s+/g, " ");
   const stoplist = new Set(["番号", "記述", "組合", "組み合わせ", "最適切", "選びなさい"]);
@@ -1109,6 +1129,29 @@ function extractThemeKeywords(text: string): string[] {
   if (!englishTerms) return [];
   const uniq = Array.from(new Set(englishTerms));
   return uniq.slice(0, 6);
+}
+
+function extractJapaneseKanjiTokens(text: string): string[] {
+  const tokens = [...text.matchAll(/[\u4e00-\u9faf]{2,}/g)].map((m) => m[0]);
+  return Array.from(new Set(tokens));
+}
+
+function comboHasNovelTerms(
+  sourceStatements: string[],
+  generatedStatements: string[],
+  minStatementsWithNovel: number
+) {
+  if (sourceStatements.length === 0 || generatedStatements.length === 0) return true;
+  const sourceSet = new Set(
+    extractJapaneseKanjiTokens(sourceStatements.join("\n"))
+  );
+  let withNovel = 0;
+  for (const stmt of generatedStatements) {
+    const tokens = extractJapaneseKanjiTokens(stmt);
+    const novel = tokens.filter((t) => !sourceSet.has(t));
+    if (novel.length >= 1) withNovel += 1;
+  }
+  return withNovel >= minStatementsWithNovel;
 }
 
 async function semanticThemeCheck(
