@@ -495,9 +495,11 @@ app.post("/generate/mc", async (req, res) => {
       return res.status(400).json({ error: "Generation provider not configured." });
     }
     const sourceItem = await parseMultipleChoice(sourceText);
-
+    const useComboStyle = detectJapaneseCombinationStyle(sourceText);
+    const statementLabels = useComboStyle ? extractJapaneseStatementLabels(sourceText) : [];
+    const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
     const minSim = 0.4;
-    const maxSim = 0.85;
+    const maxSim = expectedSubtype === "combo" ? 0.92 : 0.85;
     const maxJaccard = 0.75;
 
     const hasPassage = Boolean(sourceItem.passage && sourceItem.passage.trim());
@@ -509,9 +511,6 @@ app.post("/generate/mc", async (req, res) => {
 
     const system =
       "You generate inference multiple-choice questions. Return ONLY valid JSON.";
-    const useComboStyle = detectJapaneseCombinationStyle(sourceText);
-    const statementLabels = useComboStyle ? extractJapaneseStatementLabels(sourceText) : [];
-    const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
     let sourceCombined =
       expectedSubtype === "combo"
         ? normalizeForSimilarity(extractStatementText(sourceText))
@@ -529,7 +528,7 @@ app.post("/generate/mc", async (req, res) => {
       "Question type: inference only.",
       "Use the same language as the source.",
       useComboStyle
-        ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source.`
+        ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Do NOT paraphrase the original statements. Replace them with different audit topics (e.g., internal control, going concern, subsequent events, materiality, audit risk). Each statement must introduce a different concept from the source.`
         : "Match the overall style and structure of the source.",
       "Return ONLY valid JSON in a single line. No markdown, no code fences.",
       passageHint,
@@ -551,7 +550,8 @@ app.post("/generate/mc", async (req, res) => {
     let llmLastText: string | null = null;
     let llmLastValidationReason: string | null = null;
 
-    for (let i = 0; i < 5; i += 1) {
+    const maxAttempts = expectedSubtype === "combo" ? 8 : 5;
+    for (let i = 0; i < maxAttempts; i += 1) {
       llmAttempted = true;
       const raw = await generationProvider.generateText(prompt, system);
       llmLastText = raw;
@@ -575,11 +575,23 @@ app.post("/generate/mc", async (req, res) => {
         continue;
       }
       if (hasPassage && (!parsed.passage || !parsed.passage.trim())) {
-        llmLastValidationReason = "Missing passage.";
-        continue;
+        if (expectedSubtype === "combo") {
+          parsed.passage = null;
+        } else {
+          llmLastValidationReason = "Missing passage.";
+          continue;
+        }
       }
       if (!hasPassage && parsed.passage && parsed.passage.trim().length > 0) {
         parsed.passage = null;
+      }
+      if (expectedSubtype === "combo") {
+        const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
+        const statements = extractComboStatements(combinedText);
+        if (statements.length < (statementLabels.length || 4)) {
+          llmLastValidationReason = "Missing combo statements (ア・イ・ウ・エ).";
+          continue;
+        }
       }
       const correctChoice = parsed.choices[parsed.correctIndex];
       if (correctChoice && correctChoice.trim().toLowerCase() === sourceCorrect.toLowerCase()) {
@@ -595,7 +607,13 @@ app.post("/generate/mc", async (req, res) => {
             )
           : normalizeForSimilarity(buildCombinedText(parsed));
       if (!combined.trim()) {
-        combined = normalizeForSimilarity(buildCombinedText(parsed));
+        const fallbackText = parsed.passage ? parsed.passage : parsed.question;
+        combined = normalizeForSimilarity(
+          expectedSubtype === "combo" ? extractStatementText(fallbackText) : fallbackText
+        );
+        if (!combined.trim()) {
+          combined = normalizeForSimilarity(buildCombinedText(parsed));
+        }
       }
       const candidateVec = await embeddingProvider.embedText(combined, 8);
       const sim = cosineSimilarity(sourceVec, candidateVec);
@@ -849,6 +867,14 @@ function extractStatementText(text: string) {
     .filter(Boolean);
   const statementLines = lines.filter((l) => /^[ア-エ]．/.test(l));
   return statementLines.join("\n");
+}
+
+function extractComboStatements(text: string): string[] {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return lines.filter((l) => /^[ア-エ]．/.test(l));
 }
 
 function detectJapaneseCombinationStyle(sourceText: string) {

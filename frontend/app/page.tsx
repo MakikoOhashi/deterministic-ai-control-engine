@@ -48,6 +48,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [similarity, setSimilarity] = useState<number | null>(null);
+  const [mode, setMode] = useState<"A" | "B">("A");
 
   useEffect(() => {
     fetch(`${apiBase}/difficulty/weights`)
@@ -203,6 +204,30 @@ export default function Home() {
       </div>
 
       <div className="panel">
+        <div className="mode-bar">
+          <div className="mode-title">Mode</div>
+          <div className="mode-buttons">
+            <button
+              className={`mode-button ${mode === "A" ? "active" : ""}`}
+              onClick={() => setMode("A")}
+              type="button"
+            >
+              Mode A
+            </button>
+            <button
+              className={`mode-button ${mode === "B" ? "active" : ""}`}
+              onClick={() => setMode("B")}
+              type="button"
+            >
+              Mode B
+            </button>
+          </div>
+          <div className="mode-note">
+            {mode === "A"
+              ? "Cognitive Match (ability-based). Topic can change; difficulty profile must match."
+              : "Concept Preservation (domain-specific). Keep topic; rephrase only. (Planned)"} 
+          </div>
+        </div>
         <div className="field">
           <label>Paste target examples (1–3)</label>
           <textarea
