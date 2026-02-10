@@ -1,10 +1,11 @@
-# Deterministic AI Control Engine
+# Deterministic AI Evaluation Engine
 
 ## 概要
 
-本プロジェクトは、LLM（大規模言語モデル）を単なるテキスト生成器ではなく、**制御可能な生成エンジンとして扱うための制御インフラ**を実装する実証プロジェクトである。
+本プロジェクトは、LLM（大規模言語モデル）を単なるテキスト生成器ではなく、**評価設計に基づいて採用可否を判定する生成エンジン**として扱うための実証プロジェクトである。
 
-対象領域はDuolingo English Test形式の問題生成だが、本質は教育アプリではない。
+ユーザーが**選択肢形式で入力した問題に対し、類題を生成**する。
+対象領域は特定試験に依存しない汎用的な問題生成だが、本質は教育アプリではない。
 
 目的は以下である：
 
@@ -19,13 +20,13 @@
 
 ### 1. LLMは「候補生成器」に過ぎない
 
-生成そのものはLLMが行うが、採用可否は制御エンジンが判断する。
+生成そのものはLLMが行うが、採用可否は評価エンジンが判断する。
 
-生成と制御を明確に分離する。
+生成と評価を明確に分離する。
 
 ```
 LLM → 候補生成
-Control Engine → 制御・検証・評価
+Evaluation Engine → 検証・評価・採用判定
 ```
 
 ---
@@ -47,20 +48,20 @@ LLMは抽象化レイヤーを介して接続する。
 * 自前モデル
 * 他クラウド
 
-いずれに変更しても制御ロジックは変更不要。
+いずれに変更しても評価ロジックは変更不要。
 
 ---
 
-### 3. 制御レイヤー構造
+### 3. 評価レイヤー構造
 
-#### ① Semantic Guardrail（類似度制御）
+#### ① Semantic Guardrail（類似度評価）
 
 * Embedding生成
 * pgvector保存
 * cosine similarity検索
 * 閾値超過時は再生成
 
-目的：問題の重複を確率ではなく数値で制御する。
+目的：問題の重複を確率ではなく数値で評価し、採用可否を決定する。
 
 ---
 
@@ -240,7 +241,7 @@ Difficulty = 0.20L + 0.20S + 0.30A + 0.30R
 
 本プロジェクトの中心思想は：
 
-* LLM生成を制御可能にすること
+* LLM生成を評価可能にすること
 
 Semantic Ambiguity / Reasoning Depth は：
 
@@ -320,7 +321,7 @@ driftIndex
         ↓
 [ REST API Layer ]
         ↓
-[ Control Engine ]
+[ Evaluation Engine ]
         ↓
 [ LLM Provider Layer ]
         ↓
@@ -444,7 +445,7 @@ Mode Aは **Choice Structure Score** を表示：
 ### Frontend
 
 * Next.js
-* Control Metrics Visualization
+* Evaluation Metrics Visualization
 
 ### Infrastructure
 
@@ -474,11 +475,11 @@ Mode Aは **Choice Structure Score** を表示：
 ## 設計手順（開発プロセス）
 
 1. ベクトル保存と類似検索の実装
-2. 類似度閾値制御ループの完成
+2. 類似度閾値評価ループの完成
 3. 問題生成API完成
 4. 難易度算出ロジック追加
 5. ドリフト検出実装
-6. UIで制御メトリクス可視化
+6. UIで評価メトリクス可視化
 7. LLMをGradientへ切替
 8. DO環境へデプロイ
 
@@ -491,9 +492,9 @@ Mode Aは **Choice Structure Score** を表示：
 * 生成が不安定
 * 難易度が曖昧
 * 問題が重複する
-* セッション体験が制御不能
+* セッション体験が評価不能
 
-本プロジェクトは、「生成AIを制御可能なシステムへ変換する」ことを目的とする。
+本プロジェクトは、「生成AIを評価可能なシステムへ変換する」ことを目的とする。
 
 ---
 
@@ -501,9 +502,9 @@ Mode Aは **Choice Structure Score** を表示：
 
 本設計は以下に応用可能：
 
-* 医療QA生成制御
-* 法律問題生成制御
-* 企業研修AI制御
+* 医療QA生成の評価設計
+* 法律問題生成の評価設計
+* 企業研修AIの評価設計
 * SaaS型Adaptive Testing Engine
 
 ---
@@ -514,4 +515,4 @@ Mode Aは **Choice Structure Score** を表示：
 * 本格的な課金機能
 * 完全適応型試験エンジン
 
-本プロジェクトは「制御インフラの実証」に集中する。
+本プロジェクトは「評価インフラの実証」に集中する。
