@@ -339,7 +339,7 @@ driftIndex
 入力：
 
 * ユーザーが貼った問題文（Passage + Question + Choices）
-* Mode（A / B）
+* Mode A（Cognitive Match）
 * Target profile（L/S/A/R）
 
 処理：
@@ -352,17 +352,15 @@ driftIndex
    * 生成が失敗した場合は、**元のPassageをフォールバック**として採用
 3. **Question/Choices生成**
    * Mode A: 1候補
-   * Mode B: 2候補
 4. **検証**
    * フォーマット検証（Choice数、QuestionにChoiceが混入していないか）
    * Similarity/Jaccard閾値チェック
-   * Mode Bでは **テーマ整合性（Semantic check）** と **キーワード保持** を実施
 5. **採用**
    * 最初に条件を満たした候補を採用
 
 ---
 
-### 2. Modeの定義
+### 2. モード方針
 
 **Mode A（Cognitive Match）**
 
@@ -372,9 +370,8 @@ driftIndex
 
 **Mode B（Concept Preservation）**
 
-* 同じ概念・論点を維持しながら言い換え
-* テーマ逸脱を抑止するためのSemanticチェックを実施
-* 選択肢意図（誤答パターン）を抽象化し再生成
+* 将来実装（v1では未実装）
+* 仕様案として README にのみ記載
 
 ---
 
@@ -404,7 +401,7 @@ Mode Aは **Choice Structure Score** を表示：
 * 下部に折りたたみ式 **Difficulty Stability Console**
   * Difficulty指標（L/S/A/R/D）
   * Similarity breakdown
-  * Mode別の監査指標
+  * Choice structure監査指標
 
 ---
 
@@ -414,7 +411,7 @@ Mode Aは **Choice Structure Score** を表示：
   Baseline問題から Target profile を算出（平均 + stability + tolerance）
 
 * `POST /generate/mc`  
-  Multiple Choice生成（Mode A/B）
+  Multiple Choice生成（Mode Aのみ）
 
 * `POST /difficulty/overall`  
   L/S/A/R/D を算出
@@ -424,7 +421,7 @@ Mode Aは **Choice Structure Score** を表示：
 ### 6. 現在の制限
 
 * Mode Aは **トピック変更が前提**（能力測定型）
-* Mode Bは **テーマ保持が前提**（専門知識型）
+* Mode Bは将来実装（現時点ではAPIで無効）
 * Passage生成は長さ範囲に収まらない場合があるため、
   フォールバック（元Passage使用）を許容
 * 多形式（Fill blank / constructed response）は現在対象外

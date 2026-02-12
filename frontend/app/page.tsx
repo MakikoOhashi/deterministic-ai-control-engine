@@ -69,7 +69,6 @@ export default function Home() {
   const [similarityBreakdown, setSimilarityBreakdown] = useState<SimilarityBreakdown | null>(null);
   const [choiceIntent, setChoiceIntent] = useState<ChoiceIntent | null>(null);
   const [choiceStructure, setChoiceStructure] = useState<ChoiceStructure | null>(null);
-  const [mode, setMode] = useState<"A" | "B">("A");
 
   useEffect(() => {
     fetch(`${apiBase}/difficulty/weights`)
@@ -136,7 +135,6 @@ export default function Home() {
         body: JSON.stringify({
           sourceText,
           target: targetOverride ?? target,
-          mode,
         }),
       });
       if (!res.ok) {
@@ -238,29 +236,8 @@ export default function Home() {
       </div>
 
       <div className="panel">
-        <div className="mode-bar">
-          <div className="mode-title">Mode</div>
-          <div className="mode-buttons">
-            <button
-              className={`mode-button ${mode === "A" ? "active" : ""}`}
-              onClick={() => setMode("A")}
-              type="button"
-            >
-              Mode A
-            </button>
-            <button
-              className={`mode-button ${mode === "B" ? "active" : ""}`}
-              onClick={() => setMode("B")}
-              type="button"
-            >
-              Mode B
-            </button>
-          </div>
-          <div className="mode-note">
-            {mode === "A"
-              ? "Cognitive Match (ability-based). Topic can change; difficulty profile must match."
-              : "Concept Preservation (domain-specific). Keep topic; rephrase only."}
-          </div>
+        <div className="mode-note">
+          Cognitive Match (ability-based). Topic can change; difficulty profile must match.
         </div>
         <div className="field">
           <label>Paste target examples (1–3)</label>
@@ -326,7 +303,6 @@ export default function Home() {
         similarityBreakdown={similarityBreakdown}
         choiceIntent={choiceIntent}
         choiceStructure={choiceStructure}
-        mode={mode}
         error={error}
       />
     </main>

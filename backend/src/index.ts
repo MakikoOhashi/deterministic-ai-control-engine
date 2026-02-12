@@ -350,6 +350,9 @@ app.post("/generate/fill-blank", async (req, res) => {
     let llmLastJaccard: number | null = null;
     let llmLastText: string | null = null;
     let llmLastValidationReason: string | null = null;
+    const setValidationReason = (reason: string) => {
+      llmLastValidationReason = reason;
+    };
     if (generationProvider) {
       const base = candidates[0];
       const pattern = getBlankPattern(sourceText);
@@ -506,13 +509,18 @@ app.post("/generate/mc", async (req, res) => {
     if (!generationProvider) {
       return res.status(400).json({ error: "Generation provider not configured." });
     }
+    if (mode === "B") {
+      return res.status(400).json({
+        error: "Mode B is planned for a future release. v1 supports Mode A only.",
+      });
+    }
     const sourceItem = await parseMultipleChoice(sourceText);
     const useComboStyle = detectJapaneseCombinationStyle(sourceText);
     const statementLabels = useComboStyle ? extractJapaneseStatementLabels(sourceText) : [];
     const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
     const sourceStatements = useComboStyle ? extractComboStatements(sourceText) : [];
     const minSim = 0.4;
-    const modeLabel = mode === "B" ? "B" : "A";
+    const modeLabel = "A" as const;
     const maxSim =
       modeLabel === "B"
         ? expectedSubtype === "combo"
@@ -617,7 +625,7 @@ app.post("/generate/mc", async (req, res) => {
       "Use the same language as the source.",
       useComboStyle
         ? modeLabel === "B"
-          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same audit topic and concept, but DO NOT paraphrase line-by-line. Change structure and conditions (e.g., actor, scope, period). At least two statements must introduce different specific conditions and include new domain terms not present in the source. Do NOT reuse numeric values or exception phrasing from the source. Avoid reusing sentence order or clause structure from the source.`
+          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same legal topic and concept. Keep numeric constraints consistent with the source (years/counts must match). Internally do two steps: (1) align each statement to structure role, (2) rewrite wording with different sentence flow. Do NOT copy source sentences or clause order. At least two statements must use different condition phrasing while preserving legal meaning.`
           : `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Do NOT paraphrase the original statements. Replace them with different audit topics (e.g., internal control, going concern, subsequent events, materiality, audit risk). Each statement must introduce a different concept from the source.`
         : modeLabel === "B"
         ? "Match the overall style and structure of the source. Preserve the same topic and intent, but rephrase the content."
@@ -628,7 +636,7 @@ app.post("/generate/mc", async (req, res) => {
           )}.`
         : "",
       modeLabel === "B" && sourceStructure
-        ? `Preserve this structure per statement (type and numeric constraints must match): ${JSON.stringify(
+        ? `Preserve this structure per statement (type must match; numeric values must match exactly): ${JSON.stringify(
             sourceStructure
           )}`
         : "",
@@ -661,6 +669,9 @@ app.post("/generate/mc", async (req, res) => {
     let llmLastJaccard: number | null = null;
     let llmLastText: string | null = null;
     let llmLastValidationReason: string | null = null;
+    const setValidationReason = (reason: string) => {
+      llmLastValidationReason = reason;
+    };
 
     const maxAttempts = modeLabel === "B" && expectedSubtype === "combo" ? 3 : modeLabel === "B" ? 2 : 1;
     let best: {
@@ -681,6 +692,7 @@ app.post("/generate/mc", async (req, res) => {
         isolationIndex: number;
       } | null;
       score: number;
+      similarityWarning?: string;
     } | null = null;
 
     for (let i = 0; i < maxAttempts; i += 1) {
@@ -689,7 +701,7 @@ app.post("/generate/mc", async (req, res) => {
       llmLastText = raw;
       const candidates = extractCandidates<MultipleChoiceItem>(raw);
       if (candidates.length === 0) {
-        llmLastValidationReason = "LLM response was not valid JSON.";
+        setValidationReason("LLM response was not valid JSON.");
         continue;
       }
       for (const parsed of candidates) {
@@ -699,39 +711,83 @@ app.post("/generate/mc", async (req, res) => {
           parsed.passage = fixedPassage;
           parsed.question = stripEmbeddedPassage(parsed.question, fixedPassage);
         }
-        if (parsed.choices.length !== choiceCount) continue;
-        if (questionContainsChoices(parsed.question)) continue;
-        if (expectedSubtype === "combo" && !detectComboChoices(parsed.choices)) continue;
+        if (parsed.choices.length !== choiceCount) {
+          setValidationReason("Choice count mismatch.");
+          continue;
+        }
+        if (questionContainsChoices(parsed.question)) {
+          setValidationReason("Question contains embedded choices.");
+          continue;
+        }
+        if (expectedSubtype === "combo" && !detectComboChoices(parsed.choices)) {
+          setValidationReason("Combo choice format mismatch.");
+          continue;
+        }
         const error = validateMultipleChoice(parsed);
-        if (error) continue;
+        if (error) {
+          setValidationReason(error);
+          continue;
+        }
         if (hasPassage && !useComboStyle) {
-          if (!parsed.passage || !parsed.passage.trim()) continue;
+          if (!parsed.passage || !parsed.passage.trim()) {
+            setValidationReason("Missing passage.");
+            continue;
+          }
         } else if (hasPassage && expectedSubtype === "combo") {
           parsed.passage = null;
         }
         if (hasPassage && parsed.passage && !useComboStyle) {
           const genLen = countWords(parsed.passage);
-          if (genLen < passageMin || genLen > passageMax) continue;
+          if (genLen < passageMin || genLen > passageMax) {
+            setValidationReason("Passage length out of range.");
+            continue;
+          }
         }
         if (!hasPassage && parsed.passage && parsed.passage.trim().length > 0) {
           parsed.passage = null;
         }
+        let structureOk = true;
         if (expectedSubtype === "combo") {
           const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
           const statements = extractComboStatements(combinedText);
-          if (statements.length < (statementLabels.length || 4)) continue;
-          if (isComboTooSimilar(sourceStatements, statements)) continue;
-          if (!comboHasNovelTerms(sourceStatements, statements, 2)) continue;
+          if (statements.length < (statementLabels.length || 4)) {
+            setValidationReason("Missing combo statements.");
+            continue;
+          }
+          if (isComboTooSimilar(sourceStatements, statements)) {
+            setValidationReason("Combo statements too similar to source.");
+            continue;
+          }
+          const statementSim = comboStatementSimilarityMetrics(sourceStatements, statements);
+          if (statementSim.avgMaxJaccard > 0.58 || statementSim.maxJaccard > 0.72) {
+            setValidationReason(
+              `Combo statement difference too small (avg=${statementSim.avgMaxJaccard.toFixed(
+                3
+              )}, max=${statementSim.maxJaccard.toFixed(3)}).`
+            );
+            continue;
+          }
+          if (!comboHasNovelTerms(sourceStatements, statements, 2)) {
+            setValidationReason("Insufficient novel terms in combo statements.");
+            continue;
+          }
           if (modeLabel === "B" && sourceStructure) {
             const generatedStructure = await extractStructureItems(statements);
-            if (generatedStructure && !validateStructureMatch(sourceStructure, generatedStructure)) continue;
+            if (generatedStructure && !validateStructureMatch(sourceStructure, generatedStructure)) {
+              structureOk = false;
+              setValidationReason("Structure mismatch (type/numeric).");
+              continue;
+            }
           }
         }
         if (modeLabel === "B" && themeKeywords.length) {
           const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
           const hits = themeKeywords.filter((k) => combinedText.includes(k));
           const requiredHits = themeKeywords.length >= 4 ? 2 : 1;
-          if (hits.length < requiredHits) continue;
+          if (hits.length < requiredHits) {
+            setValidationReason("Theme keyword coverage too low.");
+            continue;
+          }
         }
         if (modeLabel === "B") {
           const sourceTopicText =
@@ -745,10 +801,18 @@ app.post("/generate/mc", async (req, res) => {
                 ).join("\n")
               : `${parsed.passage ?? ""}\n${parsed.question}`;
           const themeCheck = await semanticThemeCheck(sourceTopicText, generatedTopicText);
-          if (!themeCheck.ok) continue;
+          if (!themeCheck.ok) {
+            setValidationReason(themeCheck.reason || "Semantic theme mismatch.");
+            continue;
+          }
         }
         const correctChoice = parsed.choices[parsed.correctIndex];
-        if (correctChoice && correctChoice.trim().toLowerCase() === sourceCorrect.toLowerCase()) {
+        if (
+          expectedSubtype !== "combo" &&
+          correctChoice &&
+          correctChoice.trim().toLowerCase() === sourceCorrect.toLowerCase()
+        ) {
+          setValidationReason("Correct choice unchanged from source.");
           continue;
         }
         let combined =
@@ -771,7 +835,19 @@ app.post("/generate/mc", async (req, res) => {
         const candidateVec = await embeddingProvider.embedText(combined, 8);
         const sim = cosineSimilarity(sourceVec, candidateVec);
         const jaccard = tokenJaccard(sourceCombined, combined);
-        if (sim < minSim || sim > maxSim || jaccard > maxJaccard) continue;
+        const allowHighSimCombo =
+          modeLabel === "B" &&
+          expectedSubtype === "combo" &&
+          structureOk &&
+          sim >= minSim &&
+          sim < 0.98 &&
+          jaccard <= maxJaccard;
+        if (!allowHighSimCombo && (sim < minSim || sim > maxSim || jaccard > maxJaccard)) {
+          setValidationReason(
+            `Similarity out of range (sim=${sim.toFixed(3)}, jaccard=${jaccard.toFixed(3)}).`
+          );
+          continue;
+        }
         llmLastSim = sim;
         llmLastJaccard = jaccard;
         const textSim = async (a: string | null | undefined, b: string | null | undefined) => {
@@ -781,44 +857,61 @@ app.post("/generate/mc", async (req, res) => {
           return cosineSimilarity(aVec, bVec);
         };
         const passageSim = await textSim(sourceItem.passage, parsed.passage);
-        const questionSim = await textSim(
-          stripGenericQuestionLines(sourceItem.question),
-          stripGenericQuestionLines(parsed.question)
-        );
-        const correctChoiceSim = await textSim(
-          sourceItem.choices[sourceItem.correctIndex],
-          parsed.choices[parsed.correctIndex]
-        );
-        const distractorSim = await textSim(
-          sourceItem.choices.filter((_c, i) => i !== sourceItem.correctIndex).join(" "),
-          parsed.choices.filter((_c, i) => i !== parsed.correctIndex).join(" ")
-        );
+        const questionSim =
+          expectedSubtype === "combo"
+            ? await textSim(extractStatementText(sourceItem.question), extractStatementText(parsed.question))
+            : await textSim(
+                stripGenericQuestionLines(sourceItem.question),
+                stripGenericQuestionLines(parsed.question)
+              );
+        const correctChoiceSim =
+          expectedSubtype === "combo"
+            ? null
+            : await textSim(
+                sourceItem.choices[sourceItem.correctIndex],
+                parsed.choices[parsed.correctIndex]
+              );
+        const distractorSim =
+          expectedSubtype === "combo"
+            ? null
+            : await textSim(
+                sourceItem.choices.filter((_c, i) => i !== sourceItem.correctIndex).join(" "),
+                parsed.choices.filter((_c, i) => i !== parsed.correctIndex).join(" ")
+              );
         const overallChoicesSim =
           correctChoiceSim != null && distractorSim != null
             ? (correctChoiceSim + distractorSim) / 2
             : correctChoiceSim ?? distractorSim;
-        const choiceTexts = parsed.choices.map((c) => normalizeForSimilarity(c));
-        const vectors = await embeddingProvider.embedTexts(choiceTexts, 8);
-        const correctIdx = Math.min(Math.max(parsed.correctIndex, 0), vectors.length - 1);
-        const correctVec = vectors[correctIdx];
-        const distractorVecs = vectors.filter((_v, idx) => idx !== correctIdx);
-        const correctToDistractors = distractorVecs.map((v) =>
-          cosineSimilarity(correctVec, v)
-        );
-        const distractorPairwise = pairwiseSimilarities(distractorVecs);
-        const correctMean = mean(correctToDistractors);
-        const distractorMean = mean(distractorPairwise);
-        const distractorVar = std(distractorPairwise);
-        const isolation = correctMean - distractorMean;
-        const resolvedChoiceStructure =
-          modeLabel === "A"
-            ? {
-                correctMeanSim: correctMean,
-                distractorMeanSim: distractorMean,
-                distractorVariance: distractorVar,
-                isolationIndex: isolation,
-              }
-            : null;
+        let resolvedChoiceStructure: {
+          correctMeanSim: number;
+          distractorMeanSim: number;
+          distractorVariance: number;
+          isolationIndex: number;
+        } | null = null;
+        if (expectedSubtype !== "combo") {
+          const choiceTexts = parsed.choices.map((c) => normalizeForSimilarity(c));
+          const vectors = await embeddingProvider.embedTexts(choiceTexts, 8);
+          const correctIdx = Math.min(Math.max(parsed.correctIndex, 0), vectors.length - 1);
+          const correctVec = vectors[correctIdx];
+          const distractorVecs = vectors.filter((_v, idx) => idx !== correctIdx);
+          const correctToDistractors = distractorVecs.map((v) =>
+            cosineSimilarity(correctVec, v)
+          );
+          const distractorPairwise = pairwiseSimilarities(distractorVecs);
+          const correctMean = mean(correctToDistractors);
+          const distractorMean = mean(distractorPairwise);
+          const distractorVar = std(distractorPairwise);
+          const isolation = correctMean - distractorMean;
+          resolvedChoiceStructure =
+            modeLabel === "A"
+              ? {
+                  correctMeanSim: correctMean,
+                  distractorMeanSim: distractorMean,
+                  distractorVariance: distractorVar,
+                  isolationIndex: isolation,
+                }
+              : null;
+        }
         let score = Math.abs(sim - (modeLabel === "A" ? 0.6 : 0.8));
         if (target) {
           const combinedText = parsed.passage ? `${parsed.passage}\n\n${parsed.question}` : parsed.question;
@@ -854,6 +947,9 @@ app.post("/generate/mc", async (req, res) => {
             },
             choiceStructure: resolvedChoiceStructure,
             score,
+            similarityWarning: allowHighSimCombo
+              ? "Similarity above max; accepted due to structure match."
+              : undefined,
           };
         }
       }
@@ -871,6 +967,7 @@ app.post("/generate/mc", async (req, res) => {
         choiceIntent: choiceIntent ?? undefined,
         choiceStructure: best.choiceStructure,
         passageWarning: fixedPassageWarning ?? undefined,
+        similarityWarning: best.similarityWarning,
       });
     }
 
@@ -1147,6 +1244,29 @@ function isComboTooSimilar(sourceStatements: string[], generatedStatements: stri
   return highOverlap >= rejectThreshold;
 }
 
+function comboStatementSimilarityMetrics(
+  sourceStatements: string[],
+  generatedStatements: string[]
+) {
+  if (sourceStatements.length === 0 || generatedStatements.length === 0) {
+    return { avgMaxJaccard: 0, maxJaccard: 0 };
+  }
+  const normalizedSource = sourceStatements.map((s) => normalizeForSimilarity(s));
+  const normalizedGenerated = generatedStatements.map((s) => normalizeForSimilarity(s));
+  const maxEach: number[] = [];
+  for (const gen of normalizedGenerated) {
+    let max = 0;
+    for (const src of normalizedSource) {
+      const j = tokenJaccard(src, gen);
+      if (j > max) max = j;
+    }
+    maxEach.push(max);
+  }
+  const avgMaxJaccard = maxEach.reduce((a, b) => a + b, 0) / maxEach.length;
+  const maxJaccard = Math.max(...maxEach);
+  return { avgMaxJaccard, maxJaccard };
+}
+
 function extractThemeKeywords(text: string): string[] {
   const cleaned = text.replace(/\s+/g, " ");
   const stoplist = new Set(["番号", "記述", "組合", "組み合わせ", "最適切", "選びなさい"]);
@@ -1211,31 +1331,11 @@ function structureFromStatement(label: string, statement: string): StructureItem
 }
 
 async function extractStructureItems(statements: string[]): Promise<StructureItem[] | null> {
-  if (!generationProvider) return null;
-  const labeled = statements.map((s, idx) => `${idx + 1}. ${s}`).join("\n");
-  const system = "You extract legal structure. Return ONLY JSON array.";
-  const prompt = [
-    "Extract a structure item per statement.",
-    "Return JSON array of items with fields:",
-    'label, type (principle|exception|procedure|sanction), actor, action, condition, object, numeric (array of numbers as strings).',
-    "Use label as the original statement label (e.g., ア, イ, ウ, エ).",
-    `Statements:\n${labeled}`,
-  ].join("\n");
-  const raw = await generationProvider.generateText(prompt, system);
-  const parsed = extractJsonArray<StructureItem>(raw);
-  if (!parsed || parsed.length === 0) return null;
-  return parsed.map((item, idx) => {
-    const statement = statements[idx] || "";
-    const numeric = item.numeric && item.numeric.length ? item.numeric : extractNumericTokens(statement);
-    return {
-      label: item.label || String(idx + 1),
-      type: normalizeStructureType(item.type),
-      actor: item.actor || "",
-      action: item.action || "",
-      condition: item.condition || "",
-      object: item.object || "",
-      numeric,
-    };
+  if (statements.length === 0) return null;
+  return statements.map((statement, idx) => {
+    const labelMatch = statement.match(/^([ア-エ])．/);
+    const label = labelMatch ? labelMatch[1] : String(idx + 1);
+    return structureFromStatement(label, statement);
   });
 }
 
@@ -1244,9 +1344,11 @@ function validateStructureMatch(
   generatedItems: StructureItem[]
 ): boolean {
   if (sourceItems.length === 0 || generatedItems.length === 0) return true;
-  const len = Math.min(sourceItems.length, generatedItems.length);
+  if (sourceItems.length !== generatedItems.length) return false;
+  const len = sourceItems.length;
+  let typeMatches = 0;
   for (let i = 0; i < len; i += 1) {
-    if (sourceItems[i].type !== generatedItems[i].type) return false;
+    if (sourceItems[i].type === generatedItems[i].type) typeMatches += 1;
     if (sourceItems[i].numeric.length > 0) {
       const srcNums = new Set(sourceItems[i].numeric);
       const genNums = new Set(generatedItems[i].numeric);
@@ -1255,7 +1357,7 @@ function validateStructureMatch(
       }
     }
   }
-  return true;
+  return typeMatches >= len - 1;
 }
 
 function comboHasNovelTerms(

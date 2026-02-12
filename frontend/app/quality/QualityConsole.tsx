@@ -80,7 +80,6 @@ export default function QualityConsole(props: {
     distractorVariance: number;
     isolationIndex: number;
   } | null;
-  mode?: "A" | "B";
   error?: string | null;
 }) {
   const {
@@ -93,7 +92,6 @@ export default function QualityConsole(props: {
     similarityBreakdown,
     choiceIntent,
     choiceStructure,
-    mode,
     error,
   } = props;
 
@@ -191,7 +189,7 @@ export default function QualityConsole(props: {
           </div>
         ) : null}
 
-        {mode === "A" && choiceStructure ? (
+        {choiceStructure ? (
           <div className="table compact" style={{ marginTop: 12 }}>
             <div className="row header">
               <div>Choice Structure</div>
