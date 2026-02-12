@@ -5,9 +5,9 @@ export type ProblemFormat =
   | "constructed_response"
   | "unknown";
 
-const BLANK_REGEX = /(_\s*){2,}/;
+const BLANK_REGEX = /([_*]\s*){2,}/;
 const MC_REGEX = /^\s*(A|B|C|D)[\).]/m;
-const PREFIX_REGEX = /\b[A-Za-z]+(?:\s*_){2,}\b/;
+const PREFIX_REGEX = /\b[A-Za-z]+(?:\s*[_*]){2,}\b/;
 
 export function classifyFormat(sourceText: string): ProblemFormat {
   const text = sourceText.trim();

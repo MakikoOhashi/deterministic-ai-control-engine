@@ -1,5 +1,5 @@
 const WORD_REGEX = /[A-Za-z']+/g;
-const PREFIX_TOKEN_REGEX = /([A-Za-z]+)\s*((?:_\s*){2,})/;
+const PREFIX_TOKEN_REGEX = /([A-Za-z]+)\s*((?:[_*]\s*){2,})/;
 const COMMON_WORDS = [
   "daily",
   "problem",
@@ -149,7 +149,7 @@ export function getBlankPattern(sourceText: string): {
   const match = sourceText.match(PREFIX_TOKEN_REGEX);
   if (!match) return null;
   const prefix = match[1];
-  const blanks = match[2] || "";
+  const blanks = (match[2] || "").replace(/\*/g, "_");
   const blankCount = (blanks.match(/_/g) || []).length;
   return { prefix, blanks, blankCount };
 }
@@ -162,9 +162,9 @@ function preprocessSource(sourceText: string, preserveBlanks = false): string {
   const filtered = lines.filter(
     (l) => !/complete the sentence|choose the correct/i.test(l)
   );
-  const joined = (filtered.length > 0 ? filtered : lines).join(" ");
+  const joined = (filtered.length > 0 ? filtered : lines).join(" ").replace(/\*/g, "_");
   if (preserveBlanks) return joined;
-  return joined.replace(/(_\s*){2,}/g, "");
+  return joined.replace(/([_*]\s*){2,}/g, "");
 }
 
 export function normalizeForSimilarity(sourceText: string): string {
@@ -193,7 +193,7 @@ export function generateFillBlank(sourceText: string, mode: "first" | "longest" 
     throw new Error("No suitable target word found.");
   }
   let blanked = sentence.replace(target, "____");
-  if (/(_\s*){2,}/.test(cleanedWithBlanks)) {
+  if (/([_*]\s*){2,}/.test(cleanedWithBlanks)) {
     blanked = cleanedWithBlanks;
   }
 
@@ -208,8 +208,7 @@ export function generateFillBlank(sourceText: string, mode: "first" | "longest" 
     if (candidate) {
       target = candidate;
     } else {
-      const fallback = prefix + "e".repeat(Math.max(blankCount, 1));
-      target = fallback;
+      throw new Error("No suitable target word found for prefix blank.");
     }
     if (prefix && blanks) {
       blanked = cleanedWithBlanks.replace(PREFIX_TOKEN_REGEX, `${prefix}${blanks}`);
@@ -240,9 +239,102 @@ export function generateFillBlank(sourceText: string, mode: "first" | "longest" 
 }
 
 export function generateFillBlankCandidates(sourceText: string) {
-  return [
-    generateFillBlank(sourceText, "first"),
-    generateFillBlank(sourceText, "longest"),
-    generateFillBlank(sourceText, "last"),
-  ];
+  const out: Array<{
+    text: string;
+    correct: string;
+    distractors: string[];
+    steps: number;
+  }> = [];
+  const modes: Array<"first" | "longest" | "last"> = ["first", "longest", "last"];
+  for (const mode of modes) {
+    try {
+      out.push(generateFillBlank(sourceText, mode));
+    } catch {
+      // skip invalid candidate
+    }
+  }
+  return out;
+}
+
+export type BlankSlot = {
+  index: number;
+  start: number;
+  end: number;
+  prefix: string;
+  missingCount: number;
+  pattern: string;
+};
+
+export function extractBlankSlots(text: string): BlankSlot[] {
+  const slots: BlankSlot[] = [];
+  const occupied: Array<{ start: number; end: number }> = [];
+  const normalized = text.replace(/\*/g, "_");
+
+  const pushSlot = (slot: Omit<BlankSlot, "index">) => {
+    if (occupied.some((r) => slot.start < r.end && slot.end > r.start)) return;
+    occupied.push({ start: slot.start, end: slot.end });
+    slots.push({ ...slot, index: slots.length });
+  };
+
+  // Prefix-attached blanks like "div___" or "pro _ _ _ _"
+  const prefixRegex = /([A-Za-z]{1,6})\s*((?:_\s*){2,})/g;
+  for (const match of normalized.matchAll(prefixRegex)) {
+    const whole = match[0];
+    const prefix = match[1] || "";
+    const blankRaw = match[2] || "";
+    if (!whole || blankRaw.length === 0) continue;
+    const start = match.index ?? -1;
+    if (start < 0) continue;
+    const end = start + whole.length;
+    const missingCount = (blankRaw.match(/_/g) || []).length;
+    if (missingCount < 1) continue;
+    pushSlot({
+      start,
+      end,
+      prefix,
+      missingCount,
+      pattern: `${prefix}${blankRaw}`,
+    });
+  }
+
+  // Standalone blanks like "____"
+  const standaloneRegex = /((?:_\s*){2,})/g;
+  for (const match of normalized.matchAll(standaloneRegex)) {
+    const blankRaw = match[1] || "";
+    if (!blankRaw) continue;
+    const start = match.index ?? -1;
+    if (start < 0) continue;
+    const end = start + blankRaw.length;
+    const missingCount = (blankRaw.match(/_/g) || []).length;
+    if (missingCount < 1) continue;
+    pushSlot({
+      start,
+      end,
+      prefix: "",
+      missingCount,
+      pattern: blankRaw,
+    });
+  }
+
+  return slots.sort((a, b) => a.start - b.start).map((slot, idx) => ({ ...slot, index: idx }));
+}
+
+export function scoreFillBlankAnswers(
+  expected: string[],
+  submitted: string[]
+): {
+  total: number;
+  correct: number;
+  accuracy: number;
+  perBlank: Array<{ index: number; expected: string; submitted: string; ok: boolean }>;
+} {
+  const total = expected.length;
+  const perBlank = expected.map((exp, idx) => {
+    const sub = submitted[idx] || "";
+    const ok = exp.trim().toLowerCase() === sub.trim().toLowerCase();
+    return { index: idx, expected: exp, submitted: sub, ok };
+  });
+  const correct = perBlank.filter((p) => p.ok).length;
+  const accuracy = total === 0 ? 0 : correct / total;
+  return { total, correct, accuracy, perBlank };
 }

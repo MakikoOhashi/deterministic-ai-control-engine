@@ -136,6 +136,53 @@ textarea {
   font-size: 12px;
 }
 
+.context-completion {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  background: #fbfbfc;
+}
+
+.context-heading {
+  font-size: 20px;
+  font-weight: 700;
+  text-align: center;
+  margin-bottom: 14px;
+}
+
+.context-text {
+  font-size: 20px;
+  line-height: 1.9;
+  color: #334155;
+  margin-bottom: 12px;
+}
+
+.context-blank {
+  display: inline-flex;
+  gap: 2px;
+  vertical-align: middle;
+  margin: 0 4px;
+}
+
+.blank-cell {
+  min-width: 24px;
+  height: 34px;
+  border: 2px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.blank-cell.fixed {
+  border-color: #38bdf8;
+  background: #e0f2fe;
+}
+
 .actions button {
   min-width: 180px;
 }
@@ -162,6 +209,11 @@ button:disabled {
 
 .error {
   color: var(--bad);
+  font-size: 13px;
+}
+
+.warning {
+  color: var(--warn);
   font-size: 13px;
 }
 

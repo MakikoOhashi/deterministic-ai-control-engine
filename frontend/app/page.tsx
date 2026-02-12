@@ -41,6 +41,52 @@ type ChoiceStructure = {
   isolationIndex: number;
 };
 
+type TaskType = "context_completion" | "guided_reading";
+
+type ParsedBlank = {
+  prefix: string;
+  missingCount: number;
+  start: number;
+  end: number;
+} | null;
+
+type BlankSlot = {
+  index: number;
+  start: number;
+  end: number;
+  prefix: string;
+  missingCount: number;
+  pattern: string;
+  slotConfidence?: number;
+};
+
+function parsePrimaryBlank(text: string): ParsedBlank {
+  const prefixMatch = /([A-Za-z]+)\s*((?:[_*]\s*){2,})/.exec(text);
+  if (prefixMatch && prefixMatch.index >= 0) {
+    const rawBlank = prefixMatch[2] || "";
+    const missingCount = rawBlank.replace(/[\s]/g, "").length;
+    return {
+      prefix: prefixMatch[1] || "",
+      missingCount,
+      start: prefixMatch.index,
+      end: prefixMatch.index + prefixMatch[0].length,
+    };
+  }
+
+  const plainMatch = /([_*]\s*){2,}/.exec(text);
+  if (plainMatch && plainMatch.index >= 0) {
+    const missingCount = plainMatch[0].replace(/[\s]/g, "").length;
+    return {
+      prefix: "",
+      missingCount,
+      start: plainMatch.index,
+      end: plainMatch.index + plainMatch[0].length,
+    };
+  }
+
+  return null;
+}
+
 export default function Home() {
   const apiBase = useMemo(
     () => process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001",
@@ -55,6 +101,12 @@ export default function Home() {
   const [question, setQuestion] = useState("");
   const [choices, setChoices] = useState<string[]>([]);
   const [correctIndex, setCorrectIndex] = useState<number | null>(null);
+  const [taskType, setTaskType] = useState<TaskType>("guided_reading");
+  const [typedAnswer, setTypedAnswer] = useState("");
+  const [contextSlots, setContextSlots] = useState<BlankSlot[]>([]);
+  const [contextAnswers, setContextAnswers] = useState<string[]>([]);
+  const [contextAnswerKey, setContextAnswerKey] = useState<string[]>([]);
+  const [correctText, setCorrectText] = useState<string>("");
   const [selected, setSelected] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
 
@@ -65,10 +117,20 @@ export default function Home() {
   const [result, setResult] = useState<OverallResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
+  const [ocrFile, setOcrFile] = useState<File | null>(null);
+  const [ocrPreviewUrl, setOcrPreviewUrl] = useState<string | null>(null);
+  const [ocrLang, setOcrLang] = useState<"eng" | "jpn+eng">("eng");
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [structuring, setStructuring] = useState(false);
   const [similarity, setSimilarity] = useState<number | null>(null);
   const [similarityBreakdown, setSimilarityBreakdown] = useState<SimilarityBreakdown | null>(null);
   const [choiceIntent, setChoiceIntent] = useState<ChoiceIntent | null>(null);
   const [choiceStructure, setChoiceStructure] = useState<ChoiceStructure | null>(null);
+  const parsedBlank = useMemo(
+    () => (taskType === "context_completion" ? parsePrimaryBlank(question) : null),
+    [taskType, question]
+  );
 
   useEffect(() => {
     fetch(`${apiBase}/difficulty/weights`)
@@ -77,19 +139,95 @@ export default function Home() {
       .catch(() => setWeights(null));
   }, [apiBase]);
 
-  const handleSetTarget = async () => {
-    setLoading(true);
-    setError(null);
+  useEffect(() => {
+    if (!ocrFile) {
+      setOcrPreviewUrl(null);
+      return;
+    }
+    const next = URL.createObjectURL(ocrFile);
+    setOcrPreviewUrl(next);
+    return () => URL.revokeObjectURL(next);
+  }, [ocrFile]);
+
+  const normalizeOcrText = (raw: string) =>
+    raw
+      .replace(/\r/g, "")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+  const runInternalPreprocess = async (): Promise<string | null> => {
+    let input = baselineSources.trim();
+    if (!input && !ocrFile) {
+      setError("Paste an example or upload an image first.");
+      return null;
+    }
+
+    if (ocrFile) {
+      setOcrLoading(true);
+      try {
+        const tesseract = await import("tesseract.js");
+        const result = await tesseract.recognize(ocrFile, ocrLang);
+        const normalized = normalizeOcrText(result.data.text || "");
+        if (!normalized) throw new Error("OCR returned empty text.");
+        input = normalized;
+      } finally {
+        setOcrLoading(false);
+      }
+    }
+
+    setStructuring(true);
     try {
-      const res = await fetch(`${apiBase}/target/from-sources-mc`, {
+      const res = await fetch(`${apiBase}/ocr/structure`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sourceTexts: baselineSources
-            .split(/\n\s*\n/)
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .slice(0, 3),
+          text: input,
+          preferredTaskType: taskType,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error || "Structuring failed.");
+      }
+      const data = (await res.json()) as {
+        taskType: TaskType;
+        normalizedText?: string;
+        displayText?: string;
+      };
+      if (data.taskType && data.taskType !== taskType) {
+        setTaskType(data.taskType);
+      }
+      const normalized = (data.displayText || data.normalizedText || input).trim();
+      if (taskType === "context_completion" && !/[_*]{2,}/.test(normalized)) {
+        throw new Error("Could not detect blanks from input. Please use a clearer image or add underscores manually.");
+      }
+      setBaselineSources(normalized);
+      return normalized;
+    } finally {
+      setStructuring(false);
+    }
+  };
+
+  const handleSetTarget = async (sourceOverride?: string | null) => {
+    setLoading(true);
+    setError(null);
+    setWarning(null);
+    try {
+      const targetEndpoint =
+        taskType === "guided_reading" ? "/target/from-sources-mc" : "/target/from-sources";
+      const res = await fetch(`${apiBase}${targetEndpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sourceTexts:
+            taskType === "context_completion"
+              ? [(sourceOverride || baselineSources).trim()].filter(Boolean)
+              : (sourceOverride || baselineSources)
+                  .split(/\n\s*\n/)
+                  .map((s) => s.trim())
+                  .filter(Boolean)
+                  .slice(0, 3),
         }),
       });
       if (!res.ok) {
@@ -112,24 +250,46 @@ export default function Home() {
       setQuestion("");
       setChoices([]);
       setCorrectIndex(null);
+      setCorrectText("");
       setSelected(null);
+      setTypedAnswer("");
       return null;
     } finally {
       setLoading(false);
     }
   };
 
-  const handleGenerate = async (targetOverride?: Components | null) => {
+  useEffect(() => {
+    setPassage("");
+    setQuestion("");
+    setChoices([]);
+    setCorrectIndex(null);
+    setCorrectText("");
+    setSelected(null);
+    setTypedAnswer("");
+    setContextSlots([]);
+    setContextAnswers([]);
+    setContextAnswerKey([]);
+    setSubmitted(false);
+  }, [taskType]);
+
+  const handleGenerate = async (
+    targetOverride?: Components | null,
+    sourceOverride?: string | null
+  ) => {
     setLoading(true);
     setError(null);
     try {
-      const firstSource =
-        baselineSources
-          .split(/\n\s*\n/)
-          .map((s) => s.trim())
-          .filter(Boolean)[0] || "";
-      const sourceText = firstSource;
-      const res = await fetch(`${apiBase}/generate/mc`, {
+      const sourceText =
+        taskType === "context_completion"
+          ? (sourceOverride || baselineSources).trim()
+          : (sourceOverride || baselineSources)
+              .split(/\n\s*\n/)
+              .map((s) => s.trim())
+              .filter(Boolean)[0] || "";
+      const endpoint =
+        taskType === "guided_reading" ? "/generate/mc" : "/generate/fill-blank";
+      const res = await fetch(`${apiBase}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -142,26 +302,60 @@ export default function Home() {
         throw new Error(err.error || "Request failed");
       }
       const data = (await res.json()) as {
-        item: { passage?: string | null; question: string; choices: string[]; correctIndex: number };
+        item:
+          | { passage?: string | null; question: string; choices: string[]; correctIndex: number }
+          | { text: string; correct: string; distractors: string[] };
+        displayText?: string;
+        answerKey?: string[];
+        slots?: BlankSlot[];
         similarity?: number;
+        similarityWarning?: string;
         similarityBreakdown?: SimilarityBreakdown;
         choiceIntent?: ChoiceIntent;
         choiceStructure?: ChoiceStructure;
       };
-      setPassage(data.item.passage || "");
-      setQuestion(data.item.question);
-      setChoices(data.item.choices);
-      setCorrectIndex(data.item.correctIndex);
+      if (taskType === "guided_reading") {
+        const item = data.item as {
+          passage?: string | null;
+          question: string;
+          choices: string[];
+          correctIndex: number;
+        };
+        setPassage(item.passage || "");
+        setQuestion(item.question);
+        setChoices(item.choices);
+        setCorrectIndex(item.correctIndex);
+        setCorrectText(item.choices[item.correctIndex] || "");
+      } else {
+        const item = data.item as { text: string; correct: string; distractors: string[] };
+        setPassage("");
+        setQuestion(data.displayText || item.text);
+        const slots = Array.isArray(data.slots) ? data.slots : [];
+        const answerKey = Array.isArray(data.answerKey) ? data.answerKey : [item.correct];
+        setContextSlots(slots);
+        setContextAnswerKey(answerKey);
+        setContextAnswers(Array.from({ length: answerKey.length }, () => ""));
+        const auditChoices = [item.correct, ...item.distractors];
+        setChoices(auditChoices);
+        setCorrectIndex(0);
+        setCorrectText(item.correct);
+      }
       setSimilarity(typeof data.similarity === "number" ? data.similarity : null);
+      setWarning(data.similarityWarning ?? null);
       setSimilarityBreakdown(data.similarityBreakdown ?? null);
       setChoiceIntent(data.choiceIntent ?? null);
       setChoiceStructure(data.choiceStructure ?? null);
       setSelected(null);
+      setTypedAnswer("");
+      setContextSlots([]);
+      setContextAnswers([]);
+      setContextAnswerKey([]);
       setSubmitted(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
       setSimilarity(null);
+      setWarning(null);
       setSimilarityBreakdown(null);
       setChoiceIntent(null);
       setChoiceStructure(null);
@@ -171,8 +365,17 @@ export default function Home() {
   };
 
   const handleSetAndGenerate = async () => {
-    const nextTarget = await handleSetTarget();
-    await handleGenerate(nextTarget);
+    setError(null);
+    setWarning(null);
+    try {
+      const normalizedSource = await runInternalPreprocess();
+      if (!normalizedSource) return;
+      const nextTarget = await handleSetTarget(normalizedSource);
+      await handleGenerate(nextTarget, normalizedSource);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+    }
   };
 
   const handleAudit = async () => {
@@ -208,8 +411,28 @@ export default function Home() {
   };
 
   const correctChoice =
-    correctIndex != null && choices[correctIndex] ? choices[correctIndex] : "";
-  const isCorrect = submitted && selected === correctChoice;
+    taskType === "guided_reading"
+      ? correctIndex != null && choices[correctIndex]
+        ? choices[correctIndex]
+        : ""
+      : correctText;
+  const contextSubmittedAnswer =
+    taskType === "context_completion" && parsedBlank
+      ? `${parsedBlank.prefix}${typedAnswer}`
+      : typedAnswer;
+  const contextSubmittedList =
+    contextSlots.length > 1
+      ? contextAnswers.map((a, idx) => `${contextSlots[idx]?.prefix ?? ""}${a}`)
+      : [contextSubmittedAnswer];
+  const isCorrect =
+    submitted &&
+    (taskType === "guided_reading"
+      ? selected === correctChoice
+      : contextSlots.length > 1
+      ? contextSubmittedList.every(
+          (v, i) => v.trim().toLowerCase() === (contextAnswerKey[i] || "").trim().toLowerCase()
+        )
+      : contextSubmittedAnswer.trim().toLowerCase() === correctChoice.trim().toLowerCase());
 
   const hints = [
     target && result
@@ -236,8 +459,29 @@ export default function Home() {
       </div>
 
       <div className="panel">
+        <div className="mode-bar">
+          <div className="mode-title">Task Type</div>
+          <div className="mode-buttons">
+            <button
+              className={`mode-button ${taskType === "context_completion" ? "active" : ""}`}
+              onClick={() => setTaskType("context_completion")}
+              type="button"
+            >
+              Context Completion
+            </button>
+            <button
+              className={`mode-button ${taskType === "guided_reading" ? "active" : ""}`}
+              onClick={() => setTaskType("guided_reading")}
+              type="button"
+            >
+              Guided Reading
+            </button>
+          </div>
+        </div>
         <div className="mode-note">
-          Cognitive Match (ability-based). Topic can change; difficulty profile must match.
+          {taskType === "context_completion"
+            ? "Fill missing words using context."
+            : "Read a short passage and answer inference questions."}
         </div>
         <div className="field">
           <label>Paste target examples (1–3)</label>
@@ -247,10 +491,40 @@ export default function Home() {
             placeholder="Separate examples with a blank line."
           />
         </div>
+        <div className="field">
+          <label>Or upload screenshot (OCR)</label>
+          <input
+            type="file"
+            accept="image/*"
+            onChange={(e) => setOcrFile(e.target.files?.[0] || null)}
+          />
+          <div className="actions" style={{ marginTop: 8 }}>
+            <select
+              value={ocrLang}
+              onChange={(e) => setOcrLang(e.target.value as "eng" | "jpn+eng")}
+              style={{ maxWidth: 240 }}
+            >
+              <option value="eng">English OCR</option>
+              <option value="jpn+eng">Japanese + English OCR</option>
+            </select>
+            <span className="muted">
+              OCR + AI structuring runs automatically when you click Set Target + Generate.
+            </span>
+          </div>
+          {ocrPreviewUrl ? (
+            <div style={{ marginTop: 8 }}>
+              <img
+                src={ocrPreviewUrl}
+                alt="OCR source preview"
+                style={{ maxWidth: "100%", maxHeight: 220, borderRadius: 8, border: "1px solid #e2e8f0" }}
+              />
+            </div>
+          ) : null}
+        </div>
 
         <div className="actions" style={{ marginTop: 4 }}>
           <button onClick={handleSetAndGenerate} disabled={loading}>
-            {loading ? "Working..." : "Set Target + Generate"}
+            {loading || ocrLoading || structuring ? "Working..." : "Set Target + Generate"}
           </button>
         </div>
 
@@ -258,24 +532,107 @@ export default function Home() {
               <div className="generated-title">Generated Question</div>
               {passage ? <div className="generated-text">{passage}</div> : null}
               <div className="generated-text">{question || "—"}</div>
-              <div className="options">
-                {choices.filter(Boolean).map((opt) => (
-                  <label key={opt} className="option">
-                    <input
-                      type="radio"
-                      name="answer"
-                      value={opt}
-                      checked={selected === opt}
-                      onChange={() => setSelected(opt)}
-                    />
-                    <span>{opt}</span>
-                  </label>
-                ))}
-              </div>
+              {taskType === "guided_reading" ? (
+                <div className="options">
+                  {choices.filter(Boolean).map((opt) => (
+                    <label key={opt} className="option">
+                      <input
+                        type="radio"
+                        name="answer"
+                        value={opt}
+                        checked={selected === opt}
+                        onChange={() => setSelected(opt)}
+                      />
+                      <span>{opt}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <div className="context-completion">
+                  <div className="context-heading">Complete the text with the correct word</div>
+                  <div className="context-text">
+                    {contextSlots.length > 1 ? (
+                      question || "—"
+                    ) : parsedBlank ? (
+                      <>
+                        {question.slice(0, parsedBlank.start)}
+                        <span className="context-blank">
+                          {parsedBlank.prefix
+                            .split("")
+                            .filter(Boolean)
+                            .map((ch, idx) => (
+                              <span key={`p-${idx}`} className="blank-cell fixed">
+                                {ch}
+                              </span>
+                            ))}
+                          {Array.from({ length: parsedBlank.missingCount }).map((_, idx) => (
+                            <span key={`m-${idx}`} className="blank-cell">
+                              {typedAnswer[idx] || ""}
+                            </span>
+                          ))}
+                        </span>
+                        {question.slice(parsedBlank.end)}
+                      </>
+                    ) : (
+                      question || "—"
+                    )}
+                  </div>
+                  {contextSlots.length > 1 ? (
+                    <div className="field">
+                      <label>Type missing letters for each blank</label>
+                      {contextSlots.map((slot, idx) => (
+                        <div key={`slot-${idx}`} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                          <span className="muted" style={{ minWidth: 80 }}>
+                            Blank {idx + 1}: {slot.prefix}
+                          </span>
+                          <input
+                            value={contextAnswers[idx] || ""}
+                            onChange={(e) => {
+                              const next = e.target.value.slice(0, slot.missingCount);
+                              setContextAnswers((prev) => {
+                                const cloned = [...prev];
+                                cloned[idx] = next;
+                                return cloned;
+                              });
+                            }}
+                            placeholder={`${slot.missingCount} letters`}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="field">
+                      <label>
+                        {parsedBlank?.prefix ? "Type missing letters" : "Your answer"}
+                      </label>
+                      <input
+                        value={typedAnswer}
+                        onChange={(e) => {
+                          const next = e.target.value;
+                          if (parsedBlank) {
+                            setTypedAnswer(next.slice(0, parsedBlank.missingCount));
+                          } else {
+                            setTypedAnswer(next);
+                          }
+                        }}
+                        placeholder={
+                          parsedBlank ? `${parsedBlank.missingCount} letters` : "Type the missing word(s)"
+                        }
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="actions">
                 <button
                   onClick={() => setSubmitted(true)}
-                  disabled={!selected}
+                  disabled={
+                    taskType === "guided_reading"
+                      ? !selected
+                      : contextSlots.length > 1
+                      ? contextAnswers.some((a, idx) => (a || "").trim().length < (contextSlots[idx]?.missingCount || 0))
+                      : !typedAnswer.trim()
+                  }
                 >
                   Submit Answer
                 </button>
@@ -285,11 +642,16 @@ export default function Home() {
               </div>
               {submitted ? (
                 <div className={isCorrect ? "result good" : "result bad"}>
-                  {isCorrect ? "Correct" : `Correct answer: ${correctChoice}`}
+                  {isCorrect
+                    ? "Correct"
+                    : contextSlots.length > 1
+                    ? `Correct answers: ${contextAnswerKey.join(", ")}`
+                    : `Correct answer: ${correctChoice}`}
                 </div>
               ) : null}
             </div>
 
+        {warning ? <div className="warning" style={{ marginTop: 12 }}>{warning}</div> : null}
         {error ? <div className="error" style={{ marginTop: 12 }}>{error}</div> : null}
       </div>
 

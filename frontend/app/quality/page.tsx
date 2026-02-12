@@ -17,7 +17,13 @@ export default function QualityPage() {
 
       <div className="panel">
         <h2>Difficulty Control Console</h2>
-        <QualityConsole />
+        <QualityConsole
+          result={null}
+          target={null}
+          weights={null}
+          effectiveTolerance={0.05}
+          stability={null}
+        />
       </div>
     </main>
   );

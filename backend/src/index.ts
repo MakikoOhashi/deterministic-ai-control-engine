@@ -19,10 +19,12 @@ import { BASELINE_ITEMS } from "./config/baseline.items.js";
 import { computeTargetProfile } from "./services/target-profile.service.js";
 import {
   buildDistractorsFromText,
+  extractBlankSlots,
   generateFillBlank,
   generateFillBlankCandidates,
   getBlankPattern,
   normalizeForSimilarity,
+  scoreFillBlankAnswers,
 } from "./services/fill-blank.service.js";
 import { computeTargetFromSources } from "./services/target-from-sources.service.js";
 import { targetFromStructure } from "./services/structure-target.service.js";
@@ -259,6 +261,317 @@ app.post("/difficulty/overall", async (req, res) => {
   }
 });
 
+app.post("/fill-blank/extract", (req, res) => {
+  try {
+    const { text } = req.body as { text: string };
+    if (typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ error: "Expected { text: string }" });
+    }
+    const slots = extractBlankSlots(text);
+    return res.json({ slotCount: slots.length, slots });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+app.post("/fill-blank/grade", (req, res) => {
+  try {
+    const { expected, submitted } = req.body as {
+      expected: string[] | string;
+      submitted: string[] | string;
+    };
+    const expectedList = Array.isArray(expected) ? expected : [expected];
+    const submittedList = Array.isArray(submitted) ? submitted : [submitted];
+    if (!expectedList.every((s) => typeof s === "string")) {
+      return res.status(400).json({ error: "expected must be string or string[]" });
+    }
+    if (!submittedList.every((s) => typeof s === "string")) {
+      return res.status(400).json({ error: "submitted must be string or string[]" });
+    }
+    const result = scoreFillBlankAnswers(expectedList, submittedList);
+    return res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
+function normalizePrefixUnderscorePatterns(text: string): string {
+  let normalized = text.replace(/[＊*]/g, "_");
+
+  normalized = normalized.replace(
+    /((?:[A-Za-z]\s+){1,8})((?:_\s*){2,})/g,
+    (_m, rawPrefix: string, rawBlank: string) => {
+      const prefix = rawPrefix.replace(/\s+/g, "");
+      const blanks = (rawBlank.match(/_/g) || []).length;
+      return `${prefix}${"_".repeat(blanks)}`;
+    }
+  );
+
+  normalized = normalized.replace(
+    /([A-Za-z]{1,12})\s+((?:_\s*){2,})/g,
+    (_m, prefix: string, rawBlank: string) => {
+      const blanks = (rawBlank.match(/_/g) || []).length;
+      return `${prefix}${"_".repeat(blanks)}`;
+    }
+  );
+
+  normalized = normalized.replace(/(?:_\s*){2,}/g, (m) => {
+    const blanks = (m.match(/_/g) || []).length;
+    return "_".repeat(blanks);
+  });
+
+  return normalized;
+}
+
+function escapeRegex(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mergeSlotConfidence(rawSlots: ReturnType<typeof extractBlankSlots>, aiSlots: ReturnType<typeof extractBlankSlots>) {
+  const merged = (aiSlots.length > 0 ? aiSlots : rawSlots).map((slot) => {
+    const closestRaw = rawSlots
+      .map((r) => ({
+        slot: r,
+        score:
+          Math.abs(r.start - slot.start) +
+          (r.missingCount === slot.missingCount ? 0 : 10) +
+          (r.prefix.toLowerCase() === slot.prefix.toLowerCase() ? 0 : 5),
+      }))
+      .sort((a, b) => a.score - b.score)[0];
+    let confidence = 0.55;
+    if (closestRaw) {
+      if (closestRaw.slot.missingCount === slot.missingCount) confidence += 0.2;
+      if (closestRaw.slot.prefix.toLowerCase() === slot.prefix.toLowerCase()) confidence += 0.15;
+      if (Math.abs(closestRaw.slot.start - slot.start) <= 3) confidence += 0.1;
+    }
+    return {
+      ...slot,
+      slotConfidence: Math.max(0, Math.min(1, Number(confidence.toFixed(2)))),
+    };
+  });
+  return merged;
+}
+
+function getWordMatches(text: string): Array<{ word: string; start: number; end: number }> {
+  const matches: Array<{ word: string; start: number; end: number }> = [];
+  const regex = /[A-Za-z]+/g;
+  for (const m of text.matchAll(regex)) {
+    const word = m[0];
+    const start = m.index ?? -1;
+    if (!word || start < 0) continue;
+    matches.push({ word, start, end: start + word.length });
+  }
+  return matches;
+}
+
+function inferSlotsFromRawVsAi(
+  rawText: string,
+  aiText: string
+): Array<{
+  index: number;
+  start: number;
+  end: number;
+  prefix: string;
+  missingCount: number;
+  pattern: string;
+  slotConfidence: number;
+}> {
+  const rawWords = getWordMatches(rawText);
+  const aiWords = getWordMatches(aiText);
+  const inferred: Array<{
+    index: number;
+    start: number;
+    end: number;
+    prefix: string;
+    missingCount: number;
+    pattern: string;
+    slotConfidence: number;
+  }> = [];
+
+  let j = 0;
+  for (let i = 0; i < aiWords.length; i += 1) {
+    const aiWord = aiWords[i];
+    if (!aiWord) continue;
+    const aiLower = aiWord.word.toLowerCase();
+
+    const rawCurrent = rawWords[j];
+    if (rawCurrent && rawCurrent.word.toLowerCase() === aiLower) {
+      j += 1;
+      continue;
+    }
+
+    let bestPrefix = "";
+    let bestNextJ = j;
+    let built = "";
+    let k = j;
+    let consumed = 0;
+    while (k < rawWords.length && consumed < 6) {
+      const rawPart = rawWords[k];
+      if (!rawPart) break;
+      const part = rawPart.word.toLowerCase();
+      if (part.length > 2) break;
+      built += part;
+      consumed += 1;
+      k += 1;
+      if (!aiLower.startsWith(built)) break;
+      const missing = aiLower.length - built.length;
+      if (built.length >= 1 && missing >= 2 && missing <= 10) {
+        bestPrefix = built;
+        bestNextJ = k;
+      }
+      if (built.length >= aiLower.length) break;
+    }
+
+    if (bestPrefix) {
+      const missingCount = aiLower.length - bestPrefix.length;
+      inferred.push({
+        index: inferred.length,
+        start: aiWord.start,
+        end: aiWord.end,
+        prefix: bestPrefix,
+        missingCount,
+        pattern: `${bestPrefix}${"_".repeat(missingCount)}`,
+        slotConfidence: 0.42,
+      });
+      j = bestNextJ;
+      continue;
+    }
+
+    if (j < rawWords.length) j += 1;
+  }
+
+  return inferred;
+}
+
+function reconstructBlankDisplayFromAi(
+  aiText: string,
+  slots: Array<{
+    index: number;
+    start: number;
+    end: number;
+    prefix: string;
+    missingCount: number;
+    pattern: string;
+    slotConfidence?: number;
+  }>
+): { displayText: string; answerKey: string[] } {
+  let output = aiText;
+  const answerKey: string[] = [];
+
+  for (const slot of slots) {
+    const blankToken = `${slot.prefix}${"_".repeat(slot.missingCount)}`;
+    if (slot.prefix) {
+      const regex = new RegExp(
+        `\\b(${escapeRegex(slot.prefix)})([A-Za-z]{${slot.missingCount}})\\b`,
+        "i"
+      );
+      const match = output.match(regex);
+      if (match) {
+        answerKey.push(`${match[1]}${match[2]}`);
+        output = output.replace(regex, blankToken);
+        continue;
+      }
+    }
+    answerKey.push("");
+  }
+  return { displayText: output, answerKey };
+}
+
+app.post("/ocr/structure", async (req, res) => {
+  try {
+    const { text, preferredTaskType } = req.body as {
+      text: string;
+      preferredTaskType?: "context_completion" | "guided_reading";
+    };
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "text is required." });
+    }
+
+    const cleaned = text.replace(/\r/g, "").replace(/[ \t]+/g, " ").trim();
+    if (!cleaned) {
+      return res.status(400).json({ error: "text is empty." });
+    }
+    const rawOcrText = normalizePrefixUnderscorePatterns(cleaned);
+
+    const detectedFormat = classifyFormat(rawOcrText);
+    const inferredTask =
+      detectedFormat === "multiple_choice"
+        ? "guided_reading"
+        : detectedFormat === "prefix_blank" || detectedFormat === "full_blank"
+        ? "context_completion"
+        : "guided_reading";
+    const taskType = preferredTaskType ?? inferredTask;
+
+    if (taskType === "guided_reading") {
+      const parsed = await parseMultipleChoice(rawOcrText);
+      const normalizedText = [
+        parsed.passage ? `Passage:\n${parsed.passage}` : null,
+        `Question:\n${parsed.question}`,
+        "Choices:",
+        ...parsed.choices.map((c, idx) => `${String.fromCharCode(65 + idx)}) ${c}`),
+        `Answer: ${String.fromCharCode(65 + parsed.correctIndex)}`,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+      return res.json({
+        taskType,
+        format: "multiple_choice",
+        rawOcrText,
+        aiNormalizedText: normalizedText,
+        normalizedText,
+        item: parsed,
+      });
+    }
+
+    let aiNormalizedText = rawOcrText;
+    if (generationProvider) {
+      const system =
+        "You normalize OCR text for context-completion tasks. Return ONLY plain text.";
+      const prompt = [
+        "Clean OCR artifacts while preserving meaning.",
+        "Keep blank markers as underscores (example: div___ or ____).",
+        "Do not add choices.",
+        "Do not add explanations.",
+        `Input:\n${rawOcrText}`,
+      ].join("\n");
+      const llmOut = (await generationProvider.generateText(prompt, system)).trim();
+      if (llmOut) {
+        aiNormalizedText = normalizePrefixUnderscorePatterns(llmOut);
+      }
+    }
+
+    const rawSlots = extractBlankSlots(rawOcrText);
+    const aiSlots = extractBlankSlots(aiNormalizedText);
+    let slotsWithConfidence = mergeSlotConfidence(rawSlots, aiSlots);
+    let slotInference = "direct";
+    if (slotsWithConfidence.length === 0) {
+      slotsWithConfidence = inferSlotsFromRawVsAi(rawOcrText, aiNormalizedText);
+      slotInference = slotsWithConfidence.length > 0 ? "raw_ai_diff" : "none";
+    }
+    const reconstructed = reconstructBlankDisplayFromAi(
+      aiNormalizedText,
+      slotsWithConfidence
+    );
+    return res.json({
+      taskType,
+      format: classifyFormat(aiNormalizedText),
+      rawOcrText,
+      aiNormalizedText,
+      normalizedText: reconstructed.displayText,
+      displayText: reconstructed.displayText,
+      answerKey: reconstructed.answerKey,
+      slotCount: slotsWithConfidence.length,
+      slots: slotsWithConfidence,
+      slotInference,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
 app.post("/generate/fill-blank", async (req, res) => {
   try {
     const { sourceText, target, mode } = req.body as {
@@ -273,10 +586,35 @@ app.post("/generate/fill-blank", async (req, res) => {
     if (format === "multiple_choice" || format === "constructed_response") {
       return res.status(400).json({ error: `Format ${format} not supported in v1.` });
     }
+    const expectedBlankCount = Math.max(1, extractBlankSlots(sourceText).length);
     const candidates = generateFillBlankCandidates(sourceText);
+    if (candidates.length === 0) {
+      return res.status(422).json({
+        error: "Could not generate a valid blank candidate from this source.",
+      });
+    }
+    const sourceSlots = extractBlankSlots(sourceText);
+    const slotConstraintSummary =
+      sourceSlots.length > 0
+        ? sourceSlots
+            .map((s) => `${s.prefix || "(none)"}:${s.missingCount}`)
+            .join(", ")
+        : "single_blank";
     if (!target) {
-      const valid = candidates.find((c) => validateGenerated(c.text, format).ok);
-      return res.json({ item: valid || candidates[0], candidates, format });
+      const valid = candidates.find(
+        (c) => validateGenerated(c.text, format, { expectedBlankCount }).ok
+      );
+      const chosen = valid || candidates[0];
+      const slots = extractBlankSlots(chosen.text);
+      return res.json({
+        item: chosen,
+        displayText: chosen.text,
+        answerKey: [chosen.correct],
+        answers: [chosen.correct],
+        slots,
+        candidates,
+        format,
+      });
     }
     const scored: Array<{ item: typeof candidates[number]; distance: number; similarity: number; jaccard: number }> = [];
     const normalizedSource = normalizeForSimilarity(sourceText);
@@ -307,7 +645,7 @@ app.post("/generate/fill-blank", async (req, res) => {
     let best =
       scored.find(
         (s) =>
-          validateGenerated(s.item.text, format).ok &&
+          validateGenerated(s.item.text, format, { expectedBlankCount }).ok &&
           s.similarity >= MIN_SIM &&
           s.similarity <= MAX_SIM &&
           s.jaccard <= MAX_JACCARD
@@ -328,14 +666,17 @@ app.post("/generate/fill-blank", async (req, res) => {
       best =
         softened.find(
           (s) =>
-            validateGenerated(s.item.text, format).ok &&
+            validateGenerated(s.item.text, format, { expectedBlankCount }).ok &&
             s.similarity >= MIN_SIM &&
             s.similarity <= MAX_SIM &&
             s.jaccard <= MAX_JACCARD
         ) || null;
       if (best) {
+        const slots = extractBlankSlots(best.item.text);
         return res.json({
           item: best.item,
+          answers: [best.item.correct],
+          slots,
           candidates: scored,
           format,
           similarity: best.similarity,
@@ -372,9 +713,17 @@ app.post("/generate/fill-blank", async (req, res) => {
               `Answer must start with "${pattern.prefix}" and have exactly ${pattern.blankCount} letters after the prefix.`,
               "The text must include the full sentence with the blank in place of the answer. Do not truncate after the blank.",
               "Infer the original answer from context, then choose a DIFFERENT valid answer with the same prefix and length.",
-              "Return JSON: {\"text\":\"...\", \"answer\":\"...\", \"original\":\"...\"}",
+              expectedBlankCount > 1
+                ? "Return JSON: {\"text\":\"...\", \"answers\":[\"...\",\"...\"], \"original\":\"...\"}"
+                : "Return JSON: {\"text\":\"...\", \"answer\":\"...\", \"original\":\"...\"}",
               "The answer must start with the prefix and match total length implied by blanks. Never reuse the original answer.",
               "Do not add choices or explanations.",
+              target
+                ? `Target difficulty profile: L=${target.L.toFixed(2)}, S=${target.S.toFixed(
+                    2
+                  )}, A=${target.A.toFixed(2)}, R=${target.R.toFixed(2)}.`
+                : "Target difficulty profile: not provided.",
+              `Slot constraints: ${slotConstraintSummary}`,
               `Original: ${sourceText}`,
             ].join("\n")
           : [
@@ -383,8 +732,16 @@ app.post("/generate/fill-blank", async (req, res) => {
               "Do NOT reuse any 3-word sequence from the original.",
               "Ensure at least 30% of content words are different.",
               "Keep EXACT one blank marked with ____.",
-              "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
+              expectedBlankCount > 1
+                ? `Return JSON: {"text":"...", "answers":["..."]} with exactly ${expectedBlankCount} answers in order.`
+                : "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
               "Do not add choices or explanations.",
+              target
+                ? `Target difficulty profile: L=${target.L.toFixed(2)}, S=${target.S.toFixed(
+                    2
+                  )}, A=${target.A.toFixed(2)}, R=${target.R.toFixed(2)}.`
+                : "Target difficulty profile: not provided.",
+              `Slot constraints: ${slotConstraintSummary}`,
               `Original: ${sourceText}`,
             ].join("\n");
 
@@ -412,14 +769,23 @@ app.post("/generate/fill-blank", async (req, res) => {
           };
           rewritten = replacePrefixBlank(rewritten);
         }
-        const validation = validateGenerated(rewritten, format);
+        const validation = validateGenerated(rewritten, format, { expectedBlankCount });
         if (!validation.ok) {
           llmLastValidationReason = validation.reason || "Format validation failed.";
           continue;
         }
+        let answerList: string[] = [];
+        if (Array.isArray((parsed as { answers?: unknown }).answers)) {
+          answerList = (parsed as { answers: unknown[] }).answers
+            .map((a) => String(a || "").trim())
+            .filter(Boolean);
+        } else if ((parsed as { answer?: unknown }).answer != null) {
+          answerList = [String((parsed as { answer: unknown }).answer).trim()];
+        }
+
         if (format === "prefix_blank" && pattern) {
           const expectedLen = pattern.prefix.length + pattern.blankCount;
-          const rawAnswer = String(parsed.answer || "").trim();
+          const rawAnswer = String(answerList[0] || "").trim();
           const lowerPrefix = pattern.prefix.toLowerCase();
           const rawOriginal = String((parsed as { original?: string }).original || "").trim();
           let fullAnswer = rawAnswer;
@@ -436,7 +802,7 @@ app.post("/generate/fill-blank", async (req, res) => {
             llmLastValidationReason = "Answer length does not match blank length.";
             continue;
           }
-          parsed.answer = fullAnswer;
+          answerList = [fullAnswer];
           if (!rawOriginal) {
             llmLastValidationReason = "LLM did not provide original answer.";
             continue;
@@ -445,10 +811,18 @@ app.post("/generate/fill-blank", async (req, res) => {
           const originalFull = normalizedOriginal.startsWith(lowerPrefix)
             ? normalizedOriginal
             : `${lowerPrefix}${normalizedOriginal}`;
-          if (parsed.answer.toLowerCase() === originalFull) {
+          if (answerList[0].toLowerCase() === originalFull) {
             llmLastValidationReason = "Answer reused the original word.";
             continue;
           }
+        }
+        if (answerList.length === 0) {
+          llmLastValidationReason = "Missing answer(s).";
+          continue;
+        }
+        if (expectedBlankCount > 1 && answerList.length !== expectedBlankCount) {
+          llmLastValidationReason = `Expected ${expectedBlankCount} answers.`;
+          continue;
         }
         const candidateVec = await embeddingProvider.embedText(
           normalizeForSimilarity(rewritten),
@@ -459,13 +833,19 @@ app.post("/generate/fill-blank", async (req, res) => {
         llmLastSim = sim;
         llmLastJaccard = jaccard;
         if (sim >= MIN_SIM && sim <= MAX_SIM && jaccard <= MAX_JACCARD) {
+          const generatedItem = {
+            text: rewritten,
+            correct: answerList[0],
+            distractors: buildDistractorsFromText(rewritten, answerList[0]),
+            steps: base.steps,
+          };
+          const slots = extractBlankSlots(generatedItem.text);
           return res.json({
-            item: {
-              text: rewritten,
-              correct: parsed.answer,
-              distractors: buildDistractorsFromText(rewritten, parsed.answer),
-              steps: base.steps,
-            },
+            item: generatedItem,
+            displayText: generatedItem.text,
+            answerKey: answerList,
+            answers: answerList,
+            slots,
             candidates: scored,
             format,
             similarity: sim,
@@ -474,6 +854,76 @@ app.post("/generate/fill-blank", async (req, res) => {
           });
         }
       }
+    }
+
+    // Repair pass: minimally rewrite best candidate, then re-evaluate.
+    if (generationProvider && scored.length > 0) {
+      const base = scored[0];
+      const repairSystem =
+        "You repair fill-blank questions. Return ONLY valid JSON. Keep blank pattern unchanged.";
+      const repairPrompt = [
+        "Rewrite the sentence minimally to reduce overlap with source while keeping meaning.",
+        "Keep blank pattern exactly the same (prefix and underscore count).",
+        "Do not change answer length constraints.",
+        "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
+        `Source: ${sourceText}`,
+        `Candidate: ${base.item.text}`,
+        `Answer: ${base.item.correct}`,
+      ].join("\n");
+      const repairedRaw = await generationProvider.generateText(repairPrompt, repairSystem);
+      const repaired = extractJson(repairedRaw);
+      if (repaired && typeof repaired.text === "string" && typeof repaired.answer === "string") {
+      const validation = validateGenerated(repaired.text, format, { expectedBlankCount });
+        if (validation.ok) {
+          const normalizedCandidate = normalizeForSimilarity(repaired.text);
+          const repairedVec = await embeddingProvider.embedText(normalizedCandidate, 8);
+          const sim = cosineSimilarity(sourceVec, repairedVec);
+          const jaccard = tokenJaccard(normalizedSource, normalizedCandidate);
+          if (sim >= MIN_SIM && sim <= MAX_SIM && jaccard <= MAX_JACCARD) {
+            const repairedItem = {
+              text: repaired.text,
+              correct: repaired.answer,
+              distractors: buildDistractorsFromText(repaired.text, repaired.answer),
+              steps: base.item.steps,
+            };
+            const slots = extractBlankSlots(repairedItem.text);
+            return res.json({
+              item: repairedItem,
+              displayText: repairedItem.text,
+              answerKey: [repairedItem.correct],
+              answers: [repairedItem.correct],
+              slots,
+              candidates: scored,
+              format,
+              similarity: sim,
+              jaccard,
+              repaired: true,
+              similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+            });
+          }
+        }
+      }
+    }
+
+    // Fallback for v1 UX: return the closest candidate even if similarity thresholds are not met.
+    const fallback = scored.find(
+      (s) => validateGenerated(s.item.text, format, { expectedBlankCount }).ok
+    );
+    if (fallback) {
+      const slots = extractBlankSlots(fallback.item.text);
+      return res.json({
+        item: fallback.item,
+        displayText: fallback.item.text,
+        answerKey: [fallback.item.correct],
+        answers: [fallback.item.correct],
+        slots,
+        candidates: scored,
+        format,
+        similarity: fallback.similarity,
+        jaccard: fallback.jaccard,
+        similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+        similarityWarning: "Returned best candidate outside similarity range.",
+      });
     }
 
     return res.status(422).json({
@@ -520,15 +970,7 @@ app.post("/generate/mc", async (req, res) => {
     const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
     const sourceStatements = useComboStyle ? extractComboStatements(sourceText) : [];
     const minSim = 0.4;
-    const modeLabel = "A" as const;
-    const maxSim =
-      modeLabel === "B"
-        ? expectedSubtype === "combo"
-          ? 0.97
-          : 0.9
-        : expectedSubtype === "combo"
-        ? 0.92
-        : 0.85;
+    const maxSim = expectedSubtype === "combo" ? 0.92 : 0.85;
     const maxJaccard = 0.75;
 
     const rawPassage = extractPassageFromRaw(sourceText);
@@ -556,12 +998,10 @@ app.post("/generate/mc", async (req, res) => {
       const passageSystem = "You generate passages only. Return ONLY the passage text.";
       const passagePrompt = [
         `Write a passage between ${passageMin}-${passageMax} words.`,
-        modeLabel === "A"
-          ? "Topic can be different from the source."
-          : "Keep the same topic as the source.",
+        "Topic can be different from the source.",
         "No bullet points. No titles. Plain paragraphs only.",
       ].join("\n");
-      const passageAttempts = modeLabel === "B" ? 3 : 3;
+      const passageAttempts = 3;
       let closest: { text: string; diff: number; len: number } | null = null;
       for (let i = 0; i < passageAttempts; i += 1) {
         const candidate = (await generationProvider.generateText(passagePrompt, passageSystem)).trim();
@@ -595,17 +1035,10 @@ app.post("/generate/mc", async (req, res) => {
         return res.status(400).json({ error: "Failed to generate passage within length range." });
       }
     }
-    const themeSource =
-      modeLabel === "B" && expectedSubtype === "combo"
-        ? extractComboStatements(sourceText).join("\n")
-        : sourceText;
-    const themeKeywords = modeLabel === "B" ? extractThemeKeywords(themeSource) : [];
-    const choiceIntent = modeLabel === "B" ? await extractChoiceIntent(sourceText) : null;
-    const sourceStructure =
-      modeLabel === "B" && expectedSubtype === "combo"
-        ? await extractStructureItems(sourceStatements)
-        : null;
-    const candidateCount = modeLabel === "B" && expectedSubtype === "combo" ? 3 : modeLabel === "B" ? 2 : 1;
+    const themeKeywords: string[] = [];
+    const choiceIntent = null;
+    const sourceStructure = null;
+    const candidateCount = 1;
     let sourceCombined =
       expectedSubtype === "combo"
         ? normalizeForSimilarity(extractStatementText(sourceText))
@@ -624,22 +1057,10 @@ app.post("/generate/mc", async (req, res) => {
       "Question type: inference only.",
       "Use the same language as the source.",
       useComboStyle
-        ? modeLabel === "B"
-          ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Preserve the same legal topic and concept. Keep numeric constraints consistent with the source (years/counts must match). Internally do two steps: (1) align each statement to structure role, (2) rewrite wording with different sentence flow. Do NOT copy source sentences or clause order. At least two statements must use different condition phrasing while preserving legal meaning.`
-          : `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Do NOT paraphrase the original statements. Replace them with different audit topics (e.g., internal control, going concern, subsequent events, materiality, audit risk). Each statement must introduce a different concept from the source.`
-        : modeLabel === "B"
-        ? "Match the overall style and structure of the source. Preserve the same topic and intent, but rephrase the content."
+        ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Use different concepts than the source and avoid close paraphrase.`
         : "Match the overall style and structure of the source.",
-      modeLabel === "B" && choiceIntent
-        ? `Correct concept: ${choiceIntent.concept}. Use distractor patterns: ${choiceIntent.patterns.join(
-            ", "
-          )}.`
-        : "",
-      modeLabel === "B" && sourceStructure
-        ? `Preserve this structure per statement (type must match; numeric values must match exactly): ${JSON.stringify(
-            sourceStructure
-          )}`
-        : "",
+      "",
+      "",
       useComboStyle
         ? "For combo format, set passage to null. Put the instruction line and the ア〜エ statements in the question field only. Do NOT include any long explanatory passage."
         : "",
@@ -647,9 +1068,7 @@ app.post("/generate/mc", async (req, res) => {
         ? `Use this passage exactly and set it as the passage field:\n${fixedPassage ?? ""}`
         : "",
       "The question field must NOT include the choices. Choices must appear only in the choices array.",
-      modeLabel === "B" && themeKeywords.length
-        ? `Keep these key terms/themes present: ${themeKeywords.join(", ")}.`
-        : "",
+      "",
       "Return ONLY valid JSON in a single line. No markdown, no code fences.",
       passageHint,
       target
@@ -673,7 +1092,7 @@ app.post("/generate/mc", async (req, res) => {
       llmLastValidationReason = reason;
     };
 
-    const maxAttempts = modeLabel === "B" && expectedSubtype === "combo" ? 3 : modeLabel === "B" ? 2 : 1;
+    const maxAttempts = expectedSubtype === "combo" ? 3 : 1;
     let best: {
       item: MultipleChoiceItem;
       sim: number;
@@ -771,40 +1190,6 @@ app.post("/generate/mc", async (req, res) => {
             setValidationReason("Insufficient novel terms in combo statements.");
             continue;
           }
-          if (modeLabel === "B" && sourceStructure) {
-            const generatedStructure = await extractStructureItems(statements);
-            if (generatedStructure && !validateStructureMatch(sourceStructure, generatedStructure)) {
-              structureOk = false;
-              setValidationReason("Structure mismatch (type/numeric).");
-              continue;
-            }
-          }
-        }
-        if (modeLabel === "B" && themeKeywords.length) {
-          const combinedText = `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`;
-          const hits = themeKeywords.filter((k) => combinedText.includes(k));
-          const requiredHits = themeKeywords.length >= 4 ? 2 : 1;
-          if (hits.length < requiredHits) {
-            setValidationReason("Theme keyword coverage too low.");
-            continue;
-          }
-        }
-        if (modeLabel === "B") {
-          const sourceTopicText =
-            expectedSubtype === "combo"
-              ? extractComboStatements(sourceText).join("\n")
-              : sourceText;
-          const generatedTopicText =
-            expectedSubtype === "combo"
-              ? extractComboStatements(
-                  `${parsed.passage ?? ""}\n${parsed.question}\n${parsed.choices.join("\n")}`
-                ).join("\n")
-              : `${parsed.passage ?? ""}\n${parsed.question}`;
-          const themeCheck = await semanticThemeCheck(sourceTopicText, generatedTopicText);
-          if (!themeCheck.ok) {
-            setValidationReason(themeCheck.reason || "Semantic theme mismatch.");
-            continue;
-          }
         }
         const correctChoice = parsed.choices[parsed.correctIndex];
         if (
@@ -836,7 +1221,6 @@ app.post("/generate/mc", async (req, res) => {
         const sim = cosineSimilarity(sourceVec, candidateVec);
         const jaccard = tokenJaccard(sourceCombined, combined);
         const allowHighSimCombo =
-          modeLabel === "B" &&
           expectedSubtype === "combo" &&
           structureOk &&
           sim >= minSim &&
@@ -902,17 +1286,14 @@ app.post("/generate/mc", async (req, res) => {
           const distractorMean = mean(distractorPairwise);
           const distractorVar = std(distractorPairwise);
           const isolation = correctMean - distractorMean;
-          resolvedChoiceStructure =
-            modeLabel === "A"
-              ? {
-                  correctMeanSim: correctMean,
-                  distractorMeanSim: distractorMean,
-                  distractorVariance: distractorVar,
-                  isolationIndex: isolation,
-                }
-              : null;
+          resolvedChoiceStructure = {
+            correctMeanSim: correctMean,
+            distractorMeanSim: distractorMean,
+            distractorVariance: distractorVar,
+            isolationIndex: isolation,
+          };
         }
-        let score = Math.abs(sim - (modeLabel === "A" ? 0.6 : 0.8));
+        let score = Math.abs(sim - 0.6);
         if (target) {
           const combinedText = parsed.passage ? `${parsed.passage}\n\n${parsed.question}` : parsed.question;
           const lexical = computeLexicalComplexity(combinedText);
@@ -963,7 +1344,7 @@ app.post("/generate/mc", async (req, res) => {
         jaccard: best.jaccard,
         similarityRange: { min: minSim, max: maxSim, maxJaccard },
         similarityBreakdown: best.similarityBreakdown,
-        mode: modeLabel,
+        mode: "A",
         choiceIntent: choiceIntent ?? undefined,
         choiceStructure: best.choiceStructure,
         passageWarning: fixedPassageWarning ?? undefined,
