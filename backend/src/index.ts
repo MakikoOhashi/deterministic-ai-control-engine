@@ -297,8 +297,84 @@ app.post("/fill-blank/grade", (req, res) => {
   }
 });
 
+app.post("/vision/extract-slots", async (req, res) => {
+  try {
+    const { imageBase64, mimeType, maxSlots } = req.body as {
+      imageBase64: string;
+      mimeType?: string;
+      maxSlots?: number;
+    };
+    if (!imageBase64 || typeof imageBase64 !== "string") {
+      return res.status(400).json({ error: "imageBase64 is required." });
+    }
+    if (!generationProvider || !generationProvider.generateTextFromImage) {
+      return res.status(400).json({ error: "Vision extraction provider is not configured." });
+    }
+    const mime = typeof mimeType === "string" && mimeType ? mimeType : "image/png";
+    const cap = Math.max(1, Math.min(maxSlots ?? 6, 6));
+
+    const system =
+      "You extract blank-slot structure from English cloze images. Return ONLY valid JSON.";
+    const prompt = [
+      "Extract only structural info. Do not solve the problem.",
+      "Return strict JSON:",
+      '{"type":"prefix_blank|full_blank","slotCount":2,"slots":[{"id":1,"prefix":"fa","missingCount":2,"confidence":0.82}],"confidence":0.80}',
+      "Rules:",
+      "- slotCount must be 1 to 6.",
+      "- prefix length 0 to 4 letters.",
+      "- missingCount 1 to 10.",
+      "- confidence values between 0 and 1.",
+      `- Do not return more than ${cap} slots.`,
+    ].join("\n");
+
+    const raw = await generationProvider.generateTextFromImage(prompt, imageBase64, mime, system);
+    const parsed = extractJsonObject<{
+      type?: "prefix_blank" | "full_blank";
+      slotCount?: number;
+      slots?: Array<{ id?: number; prefix?: string; missingCount?: number; confidence?: number }>;
+      confidence?: number;
+    }>(raw);
+    if (!parsed || !Array.isArray(parsed.slots)) {
+      return res.status(422).json({ error: "Failed to parse vision slot extraction." });
+    }
+    const slots = parsed.slots
+      .map((s, idx) => ({
+        id: s.id ?? idx + 1,
+        prefix: String(s.prefix || "").toLowerCase(),
+        missingCount: Number(s.missingCount || 0),
+        confidence: Number(s.confidence ?? 0.7),
+      }))
+      .filter(
+        (s) =>
+          /^[a-z]{0,4}$/.test(s.prefix) &&
+          Number.isFinite(s.missingCount) &&
+          s.missingCount >= 1 &&
+          s.missingCount <= 10
+      )
+      .slice(0, cap);
+
+    const confidence =
+      slots.length === 0
+        ? 0
+        : slots.reduce((sum, s) => sum + Math.max(0, Math.min(1, s.confidence)), 0) / slots.length;
+
+    return res.json({
+      type: parsed.type === "full_blank" ? "full_blank" : "prefix_blank",
+      slotCount: slots.length,
+      slots,
+      confidence: Number(confidence.toFixed(2)),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    return res.status(400).json({ error: message });
+  }
+});
+
 function normalizePrefixUnderscorePatterns(text: string): string {
-  let normalized = text.replace(/[＊*]/g, "_");
+  let normalized = text
+    .replace(/[＊*＿]/g, "_")
+    .replace(/[–—−]/g, "_")
+    .replace(/\.{2,}|…+/g, "_");
 
   normalized = normalized.replace(
     /((?:[A-Za-z]\s+){1,8})((?:_\s*){2,})/g,
@@ -318,11 +394,93 @@ function normalizePrefixUnderscorePatterns(text: string): string {
   );
 
   normalized = normalized.replace(/(?:_\s*){2,}/g, (m) => {
-    const blanks = (m.match(/_/g) || []).length;
+    const blanks = Math.max(2, Math.min((m.match(/_/g) || []).length, 10));
     return "_".repeat(blanks);
   });
 
+  normalized = normalized.replace(/\s{2,}/g, " ").trim();
   return normalized;
+}
+
+function fallbackRegexSlotExtract(text: string) {
+  const slots: Array<{
+    index: number;
+    start: number;
+    end: number;
+    prefix: string;
+    missingCount: number;
+    pattern: string;
+    slotConfidence: number;
+  }> = [];
+  const normalized = normalizePrefixUnderscorePatterns(text);
+  const regex = /([A-Za-z]{1,4})\s*(_{2,10})/g;
+  for (const m of normalized.matchAll(regex)) {
+    const prefix = m[1] || "";
+    const blanks = m[2] || "";
+    const start = m.index ?? -1;
+    if (start < 0) continue;
+    slots.push({
+      index: slots.length,
+      start,
+      end: start + (m[0]?.length || 0),
+      prefix: prefix.toLowerCase(),
+      missingCount: blanks.length,
+      pattern: `${prefix}${blanks}`,
+      slotConfidence: 0.58,
+    });
+  }
+  return slots;
+}
+
+function validateStructuredSlots(
+  displayText: string,
+  slots: Array<{
+    id?: number;
+    prefix: string;
+    missingCount: number;
+    confidence?: number;
+  }>
+) {
+  const valid = slots
+    .filter((s) => /^[A-Za-z]{1,4}$/.test(s.prefix) && s.missingCount >= 1 && s.missingCount <= 8)
+    .map((s, idx) => {
+      const pattern = `${s.prefix}${"_".repeat(s.missingCount)}`;
+      return {
+        index: idx,
+        start: displayText.indexOf(pattern),
+        end: displayText.indexOf(pattern) >= 0 ? displayText.indexOf(pattern) + pattern.length : -1,
+        prefix: s.prefix,
+        missingCount: s.missingCount,
+        pattern,
+        slotConfidence: Math.max(0, Math.min(1, s.confidence ?? 0.75)),
+      };
+    })
+    .filter((s) => s.start >= 0);
+  return valid;
+}
+
+function estimateCefrLevel(text: string): "B2" | "C1" {
+  const words = (text.match(/[A-Za-z]+/g) || []).map((w) => w.toLowerCase());
+  if (words.length === 0) return "B2";
+  const avgLen = words.reduce((sum, w) => sum + w.length, 0) / words.length;
+  const longRatio = words.filter((w) => w.length >= 8).length / words.length;
+  return avgLen >= 5.6 || longRatio >= 0.28 ? "C1" : "B2";
+}
+
+function textLengthBucket(text: string): "short" | "medium" {
+  const count = countWords(text);
+  return count <= 90 ? "short" : "medium";
+}
+
+function buildContextSnippet(
+  text: string,
+  start: number,
+  end: number,
+  radius = 24
+): string {
+  const left = Math.max(0, start - radius);
+  const right = Math.min(text.length, end + radius);
+  return text.slice(left, right).replace(/\s+/g, " ").trim();
 }
 
 function escapeRegex(text: string): string {
@@ -481,9 +639,10 @@ function reconstructBlankDisplayFromAi(
 
 app.post("/ocr/structure", async (req, res) => {
   try {
-    const { text, preferredTaskType } = req.body as {
+    const { text, preferredTaskType, visionSlots } = req.body as {
       text: string;
       preferredTaskType?: "context_completion" | "guided_reading";
+      visionSlots?: Array<{ prefix?: string; missingCount?: number; confidence?: number }>;
     };
     if (!text || typeof text !== "string") {
       return res.status(400).json({ error: "text is required." });
@@ -542,18 +701,122 @@ app.post("/ocr/structure", async (req, res) => {
       }
     }
 
-    const rawSlots = extractBlankSlots(rawOcrText);
-    const aiSlots = extractBlankSlots(aiNormalizedText);
-    let slotsWithConfidence = mergeSlotConfidence(rawSlots, aiSlots);
-    let slotInference = "direct";
+    let aiSlots = extractBlankSlots(aiNormalizedText);
+    let structuredByFallbackLlm = false;
+    let slotsWithConfidence = mergeSlotConfidence([], aiSlots);
+    let slotInference = aiSlots.length > 0 ? "ai_direct" : "none";
+
+    const validatedVisionSlots = Array.isArray(visionSlots)
+      ? visionSlots
+          .map((s, idx) => ({
+            id: idx + 1,
+            prefix: String(s.prefix || "").toLowerCase(),
+            missingCount: Number(s.missingCount || 0),
+            confidence: Number(s.confidence ?? 0.75),
+          }))
+          .filter(
+            (s) =>
+              /^[a-z]{0,4}$/.test(s.prefix) &&
+              Number.isFinite(s.missingCount) &&
+              s.missingCount >= 1 &&
+              s.missingCount <= 10
+          )
+          .slice(0, 6)
+      : [];
+    if (validatedVisionSlots.length > 0) {
+      const visionReconstructed = reconstructBlankDisplayFromAi(
+        aiNormalizedText,
+        validatedVisionSlots.map((s, idx) => ({
+          index: idx,
+          start: 0,
+          end: 0,
+          prefix: s.prefix,
+          missingCount: s.missingCount,
+          pattern: `${s.prefix}${"_".repeat(s.missingCount)}`,
+          slotConfidence: s.confidence,
+        }))
+      );
+      const recoveredSlots = extractBlankSlots(visionReconstructed.displayText);
+      if (recoveredSlots.length > 0) {
+        aiNormalizedText = visionReconstructed.displayText;
+        aiSlots = recoveredSlots;
+        slotsWithConfidence = aiSlots.map((slot, idx) => ({
+          ...slot,
+          slotConfidence: validatedVisionSlots[idx]?.confidence ?? 0.75,
+        }));
+        slotInference = "vision_ai";
+      }
+    }
+
+    if (slotsWithConfidence.length === 0 && generationProvider) {
+      const fallbackSystem =
+        "You repair corrupted OCR for context-completion tasks. Return ONLY valid JSON.";
+      const fallbackPrompt = [
+        "The input is a broken OCR text for fill-in-the-blank.",
+        "Output blanks using prefix+underscores only (example: fa__).",
+        "Do NOT output a fully completed sentence.",
+        "Return strict JSON:",
+        "{\"displayText\":\"...\",\"slots\":[{\"id\":1,\"prefix\":\"fa\",\"missingCount\":2,\"confidence\":0.82}],\"slotCount\":1,\"notes\":\"...\"}",
+        "Constraints: prefix 1-4 letters; missingCount 1-8; slotCount 1-6.",
+        "displayText must contain each prefix+underscore pattern listed in slots.",
+        `Input:\n${aiNormalizedText}`,
+      ].join("\n");
+
+      for (let attempt = 0; attempt < 2 && slotsWithConfidence.length === 0; attempt += 1) {
+        const rawFallback = await generationProvider.generateText(fallbackPrompt, fallbackSystem);
+        const parsedFallback = extractJsonObject<{
+          displayText?: string;
+          slots?: Array<{ id?: number; prefix: string; missingCount: number; confidence?: number }>;
+        }>(rawFallback);
+        if (!parsedFallback || typeof parsedFallback.displayText !== "string") continue;
+        const repaired = normalizePrefixUnderscorePatterns(parsedFallback.displayText);
+        const validatedSlots = validateStructuredSlots(repaired, parsedFallback.slots || []);
+        if (validatedSlots.length === 0) continue;
+
+        aiNormalizedText = repaired;
+        aiSlots = extractBlankSlots(repaired);
+        structuredByFallbackLlm = true;
+        slotsWithConfidence = validatedSlots;
+        slotInference = "fallback_llm";
+      }
+    }
     if (slotsWithConfidence.length === 0) {
-      slotsWithConfidence = inferSlotsFromRawVsAi(rawOcrText, aiNormalizedText);
-      slotInference = slotsWithConfidence.length > 0 ? "raw_ai_diff" : "none";
+      const fallbackSlots = fallbackRegexSlotExtract(aiNormalizedText);
+      if (fallbackSlots.length > 0) {
+        slotsWithConfidence = fallbackSlots;
+        slotInference = "fallback_regex";
+      } else {
+        slotInference = "none";
+      }
+    }
+    if (slotsWithConfidence.length > 6) {
+      slotsWithConfidence = slotsWithConfidence
+        .sort((a, b) => (b.slotConfidence ?? 0) - (a.slotConfidence ?? 0))
+        .slice(0, 6)
+        .sort((a, b) => a.start - b.start)
+        .map((s, i) => ({ ...s, index: i }));
+      if (slotInference === "ai_direct") {
+        slotInference = "ai_direct_capped";
+      }
     }
     const reconstructed = reconstructBlankDisplayFromAi(
       aiNormalizedText,
       slotsWithConfidence
     );
+    const answerKey = reconstructed.answerKey;
+    const cappedSlots = slotsWithConfidence.slice(0, 2).map((slot) => ({
+      ...slot,
+      contextSnippet: buildContextSnippet(reconstructed.displayText, slot.start, slot.end),
+    }));
+    const hasPrefix = cappedSlots.some((s) => s.prefix.length > 0);
+    const extraction = {
+      taskType: "context_completion" as const,
+      blankCount: cappedSlots.length,
+      hasPrefix,
+      prefixMode: hasPrefix ? "hasPrefix" as const : "none" as const,
+      textLengthBucket: textLengthBucket(reconstructed.displayText),
+      cefr: estimateCefrLevel(reconstructed.displayText),
+    };
     return res.json({
       taskType,
       format: classifyFormat(aiNormalizedText),
@@ -561,10 +824,12 @@ app.post("/ocr/structure", async (req, res) => {
       aiNormalizedText,
       normalizedText: reconstructed.displayText,
       displayText: reconstructed.displayText,
-      answerKey: reconstructed.answerKey,
-      slotCount: slotsWithConfidence.length,
-      slots: slotsWithConfidence,
+      answerKey,
+      slotCount: cappedSlots.length,
+      slots: cappedSlots,
       slotInference,
+      structuredByFallbackLlm,
+      extraction,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
@@ -582,29 +847,56 @@ app.post("/generate/fill-blank", async (req, res) => {
     if (typeof sourceText !== "string") {
       return res.status(400).json({ error: "Expected { sourceText: string }" });
     }
-    const format = classifyFormat(sourceText);
+    const cleanedSourceText = sourceText
+      // OCR often injects underscores inside normal words (e.g., i__d_). Remove those artifacts.
+      .replace(/(?<=[A-Za-z])_{1,3}(?=[A-Za-z])/g, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    const format = classifyFormat(cleanedSourceText);
     if (format === "multiple_choice" || format === "constructed_response") {
       return res.status(400).json({ error: `Format ${format} not supported in v1.` });
     }
-    const expectedBlankCount = Math.max(1, extractBlankSlots(sourceText).length);
-    const candidates = generateFillBlankCandidates(sourceText);
-    if (candidates.length === 0) {
+    const extractedSlots = extractBlankSlots(cleanedSourceText).filter(
+      (s) => s.prefix.length <= 4 && s.missingCount >= 1 && s.missingCount <= 8
+    );
+    // v1 cloze: keep generation flexible by limiting slot control to 1-2 blanks.
+    const expectedBlankCount = Math.max(1, Math.min(extractedSlots.length || 1, 2));
+    const candidates = generateFillBlankCandidates(cleanedSourceText);
+    if (candidates.length === 0 && !generationProvider) {
       return res.status(422).json({
         error: "Could not generate a valid blank candidate from this source.",
       });
     }
-    const sourceSlots = extractBlankSlots(sourceText);
+    const sourceSlots = extractBlankSlots(cleanedSourceText);
+    const slotRules = (sourceSlots.length > 0 ? sourceSlots : extractedSlots)
+      .slice(0, expectedBlankCount)
+      .map((s) => ({
+        prefix: s.prefix || "",
+        missingCount: s.missingCount,
+      }));
     const slotConstraintSummary =
-      sourceSlots.length > 0
-        ? sourceSlots
+      slotRules.length > 0
+        ? slotRules
             .map((s) => `${s.prefix || "(none)"}:${s.missingCount}`)
             .join(", ")
         : "single_blank";
     if (!target) {
+      if (candidates.length === 0) {
+        return res.status(422).json({
+          error: generationProvider
+            ? "Could not build deterministic candidates. Please retry."
+            : "Could not generate a valid blank candidate from this source.",
+        });
+      }
       const valid = candidates.find(
         (c) => validateGenerated(c.text, format, { expectedBlankCount }).ok
       );
       const chosen = valid || candidates[0];
+      if (!chosen) {
+        return res.status(422).json({
+          error: "Could not generate a valid blank candidate from this source.",
+        });
+      }
       const slots = extractBlankSlots(chosen.text);
       return res.json({
         item: chosen,
@@ -617,7 +909,7 @@ app.post("/generate/fill-blank", async (req, res) => {
       });
     }
     const scored: Array<{ item: typeof candidates[number]; distance: number; similarity: number; jaccard: number }> = [];
-    const normalizedSource = normalizeForSimilarity(sourceText);
+    const normalizedSource = normalizeForSimilarity(cleanedSourceText);
     const sourceVec = await embeddingProvider.embedText(normalizedSource, 8);
     for (const c of candidates) {
       const lexical = computeLexicalComplexity(c.text);
@@ -638,9 +930,12 @@ app.post("/generate/fill-blank", async (req, res) => {
       scored.push({ item: c, distance: Math.sqrt(d), similarity, jaccard });
     }
     scored.sort((a, b) => a.distance - b.distance);
-    const MIN_SIM = 0.4;
-    const MAX_SIM = 0.85;
-    const MAX_JACCARD = 0.75;
+    // Cloze-specific thresholds:
+    // - allow higher semantic similarity to keep same difficulty shape
+    // - tighten lexical overlap to avoid near-copy
+    const MIN_SIM = 0.35;
+    const MAX_SIM = 0.93;
+    const MAX_JACCARD = 0.6;
     let attempts = 0;
     let best =
       scored.find(
@@ -695,12 +990,17 @@ app.post("/generate/fill-blank", async (req, res) => {
       llmLastValidationReason = reason;
     };
     if (generationProvider) {
-      const base = candidates[0];
-      const pattern = getBlankPattern(sourceText);
+      const base = candidates[0] || {
+        text: sourceText,
+        correct: "",
+        distractors: [] as string[],
+        steps: 2,
+      };
+      const pattern = getBlankPattern(cleanedSourceText);
       const system =
         "You generate fill-in-the-blank questions. Return ONLY valid JSON. Never copy the original sentence.";
       const prompt =
-        format === "prefix_blank" && pattern
+        format === "prefix_blank" && pattern && expectedBlankCount === 1
           ? [
               "Create ONE new sentence similar in meaning but NOT a copy.",
               "Change the subject and clause order. Replace key phrases with synonyms.",
@@ -713,9 +1013,7 @@ app.post("/generate/fill-blank", async (req, res) => {
               `Answer must start with "${pattern.prefix}" and have exactly ${pattern.blankCount} letters after the prefix.`,
               "The text must include the full sentence with the blank in place of the answer. Do not truncate after the blank.",
               "Infer the original answer from context, then choose a DIFFERENT valid answer with the same prefix and length.",
-              expectedBlankCount > 1
-                ? "Return JSON: {\"text\":\"...\", \"answers\":[\"...\",\"...\"], \"original\":\"...\"}"
-                : "Return JSON: {\"text\":\"...\", \"answer\":\"...\", \"original\":\"...\"}",
+              "Return JSON: {\"text\":\"...\", \"answer\":\"...\", \"original\":\"...\"}",
               "The answer must start with the prefix and match total length implied by blanks. Never reuse the original answer.",
               "Do not add choices or explanations.",
               target
@@ -724,7 +1022,7 @@ app.post("/generate/fill-blank", async (req, res) => {
                   )}, A=${target.A.toFixed(2)}, R=${target.R.toFixed(2)}.`
                 : "Target difficulty profile: not provided.",
               `Slot constraints: ${slotConstraintSummary}`,
-              `Original: ${sourceText}`,
+              `Original: ${cleanedSourceText}`,
             ].join("\n")
           : [
               "Create ONE new sentence similar in meaning but NOT a copy.",
@@ -735,6 +1033,9 @@ app.post("/generate/fill-blank", async (req, res) => {
               expectedBlankCount > 1
                 ? `Return JSON: {"text":"...", "answers":["..."]} with exactly ${expectedBlankCount} answers in order.`
                 : "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
+              expectedBlankCount > 1
+                ? `For each answers[i], obey slot rule i: ${slotConstraintSummary}. Each answer must be a single word with matching prefix and total length.`
+                : "",
               "Do not add choices or explanations.",
               target
                 ? `Target difficulty profile: L=${target.L.toFixed(2)}, S=${target.S.toFixed(
@@ -742,7 +1043,7 @@ app.post("/generate/fill-blank", async (req, res) => {
                   )}, A=${target.A.toFixed(2)}, R=${target.R.toFixed(2)}.`
                 : "Target difficulty profile: not provided.",
               `Slot constraints: ${slotConstraintSummary}`,
-              `Original: ${sourceText}`,
+              `Original: ${cleanedSourceText}`,
             ].join("\n");
 
       for (let i = 0; i < 3; i += 1) {
@@ -755,7 +1056,8 @@ app.post("/generate/fill-blank", async (req, res) => {
           continue;
         }
         let rewritten = parsed.text;
-        if (format === "prefix_blank" && pattern) {
+        rewritten = normalizePrefixUnderscorePatterns(rewritten);
+        if (format === "prefix_blank" && pattern && expectedBlankCount === 1) {
           const replacePrefixBlank = (input: string) => {
             const prefixBlankRegex = /([A-Za-z]+)\s*((?:_\s*){2,})/;
             if (prefixBlankRegex.test(input)) {
@@ -783,7 +1085,7 @@ app.post("/generate/fill-blank", async (req, res) => {
           answerList = [String((parsed as { answer: unknown }).answer).trim()];
         }
 
-        if (format === "prefix_blank" && pattern) {
+        if (format === "prefix_blank" && pattern && expectedBlankCount === 1) {
           const expectedLen = pattern.prefix.length + pattern.blankCount;
           const rawAnswer = String(answerList[0] || "").trim();
           const lowerPrefix = pattern.prefix.toLowerCase();
@@ -823,6 +1125,26 @@ app.post("/generate/fill-blank", async (req, res) => {
         if (expectedBlankCount > 1 && answerList.length !== expectedBlankCount) {
           llmLastValidationReason = `Expected ${expectedBlankCount} answers.`;
           continue;
+        }
+        if (expectedBlankCount > 1 && slotRules.length === expectedBlankCount) {
+          let multiRuleOk = true;
+          for (let idx = 0; idx < expectedBlankCount; idx += 1) {
+            const rule = slotRules[idx];
+            const ans = String(answerList[idx] || "").replace(/\s+/g, "").toLowerCase();
+            if (!ans) {
+              llmLastValidationReason = `Missing answer at index ${idx}.`;
+              multiRuleOk = false;
+              break;
+            }
+            if (rule.prefix && !ans.startsWith(rule.prefix.toLowerCase())) {
+              llmLastValidationReason = `Answer ${idx + 1} does not start with required prefix.`;
+              multiRuleOk = false;
+              break;
+            }
+            // v1: do not hard-fail by length on multi-blank OCR inputs.
+            answerList[idx] = ans;
+          }
+          if (!multiRuleOk) continue;
         }
         const candidateVec = await embeddingProvider.embedText(
           normalizeForSimilarity(rewritten),
@@ -866,7 +1188,7 @@ app.post("/generate/fill-blank", async (req, res) => {
         "Keep blank pattern exactly the same (prefix and underscore count).",
         "Do not change answer length constraints.",
         "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
-        `Source: ${sourceText}`,
+        `Source: ${cleanedSourceText}`,
         `Candidate: ${base.item.text}`,
         `Answer: ${base.item.correct}`,
       ].join("\n");
@@ -926,8 +1248,18 @@ app.post("/generate/fill-blank", async (req, res) => {
       });
     }
 
+    const errorType =
+      llmLastValidationReason != null
+        ? "VALIDATION_FAILED"
+        : scored.length > 0
+        ? "SIMILARITY_REJECTED"
+        : "NO_CANDIDATE";
     return res.status(422).json({
-      error: "Generated problem too similar to source. Please try again.",
+      error:
+        errorType === "VALIDATION_FAILED"
+          ? "Generated candidate failed format validation. Please retry."
+          : "Generated problem too similar to source. Please try again.",
+      errorType,
       similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
       debug: {
         llmAttempted,
@@ -1155,7 +1487,7 @@ app.post("/generate/mc", async (req, res) => {
         } else if (hasPassage && expectedSubtype === "combo") {
           parsed.passage = null;
         }
-        if (hasPassage && parsed.passage && !useComboStyle) {
+        if (hasPassage && parsed.passage && !useComboStyle && !fixedPassage) {
           const genLen = countWords(parsed.passage);
           if (genLen < passageMin || genLen > passageMax) {
             setValidationReason("Passage length out of range.");
@@ -1353,8 +1685,12 @@ app.post("/generate/mc", async (req, res) => {
     }
 
     return res.status(422).json({
-      error: "Generated problem too similar to source. Please try again.",
+      error:
+        llmLastValidationReason === "Passage length out of range."
+          ? "Generated passage length did not meet target range. Please try again."
+          : "Generated problem too similar to source. Please try again.",
       similarityRange: { min: minSim, max: maxSim, maxJaccard },
+      reason: llmLastValidationReason || null,
       debug: {
         llmAttempted,
         llmLastSim,
@@ -1524,14 +1860,31 @@ function tokenJaccard(a: string, b: string): number {
   return union.size === 0 ? 0 : inter / union.size;
 }
 
-function extractJson(text: string): { text: string; answer: string } | null {
+function extractJson(
+  text: string
+): { text: string; answer?: string; answers?: string[]; original?: string } | null {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) return null;
   try {
     const obj = JSON.parse(text.slice(start, end + 1));
-    if (typeof obj.text === "string" && typeof obj.answer === "string") {
-      return { text: obj.text.trim(), answer: obj.answer.trim() };
+    if (typeof obj.text !== "string") return null;
+    const cleaned = {
+      text: obj.text.trim(),
+      answer:
+        typeof obj.answer === "string" && obj.answer.trim().length > 0
+          ? obj.answer.trim()
+          : undefined,
+      answers: Array.isArray(obj.answers)
+        ? obj.answers.map((a: unknown) => String(a || "").trim()).filter(Boolean)
+        : undefined,
+      original:
+        typeof obj.original === "string" && obj.original.trim().length > 0
+          ? obj.original.trim()
+          : undefined,
+    };
+    if (cleaned.answer || (cleaned.answers && cleaned.answers.length > 0)) {
+      return cleaned;
     }
     return null;
   } catch {

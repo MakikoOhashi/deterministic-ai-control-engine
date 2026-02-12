@@ -2,7 +2,8 @@ import type { ProblemFormat } from "./format-classifier.service.js";
 
 const BLANK_REGEX = /(_\s*){2,}/g;
 const MC_REGEX = /^\s*(A|B|C|D)[\).]/m;
-const PREFIX_REGEX = /\b[A-Za-z]+(?:\s*_){2,}\b/;
+// Accept both "fa__" and spaced variants like "fa _ _".
+const PREFIX_REGEX = /\b[A-Za-z]{1,5}\s*(?:_\s*){2,}\b/;
 
 export function validateGenerated(
   text: string,

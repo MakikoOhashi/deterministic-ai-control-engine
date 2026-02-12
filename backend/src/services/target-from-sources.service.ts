@@ -52,12 +52,19 @@ export async function computeTargetFromSources(
 
   for (const source of items) {
     const candidate = generateFillBlankCandidates(source)[0];
-    const lexical = computeLexicalComplexity(candidate.text);
-    const structural = computeStructuralComplexity(candidate.text);
-    const correctVec = await provider.embedText(candidate.correct, 8);
-    const distractorVecs = await provider.embedTexts(candidate.distractors, 8);
+    const evalText = candidate?.text ?? source;
+    const evalCorrect =
+      candidate?.correct ??
+      (source.match(/[A-Za-z]{4,}/)?.[0] || "answer");
+    const evalDistractors = candidate?.distractors ?? ["option", "sample", "value"];
+    const evalSteps = candidate?.steps ?? 2;
+
+    const lexical = computeLexicalComplexity(evalText);
+    const structural = computeStructuralComplexity(evalText);
+    const correctVec = await provider.embedText(evalCorrect, 8);
+    const distractorVecs = await provider.embedTexts(evalDistractors, 8);
     const A = semanticAmbiguityA(correctVec, distractorVecs);
-    const R = normalizeReasoningDepth(candidate.steps, maxSteps);
+    const R = normalizeReasoningDepth(evalSteps, maxSteps);
     Ls.push(lexical.L);
     Ss.push(structural.S);
     As.push(A);

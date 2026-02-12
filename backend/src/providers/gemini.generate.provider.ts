@@ -1,5 +1,11 @@
 export interface TextGenerationProvider {
   generateText(prompt: string, system?: string): Promise<string>;
+  generateTextFromImage?(
+    prompt: string,
+    imageBase64: string,
+    mimeType: string,
+    system?: string
+  ): Promise<string>;
 }
 
 export class GeminiTextGenerationProvider implements TextGenerationProvider {
@@ -55,5 +61,52 @@ export class GeminiTextGenerationProvider implements TextGenerationProvider {
       throw new Error(`Gemini generateContent failed: ${msg}`);
     }
     throw new Error("Gemini generateContent failed after retries.");
+  }
+
+  async generateTextFromImage(
+    prompt: string,
+    imageBase64: string,
+    mimeType: string,
+    system?: string
+  ): Promise<string> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": this.apiKey,
+      },
+      body: JSON.stringify({
+        system_instruction: system ? { parts: [{ text: system }] } : undefined,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: mimeType,
+                  data: imageBase64,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 600,
+        },
+      }),
+    });
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`Gemini vision generateContent failed: ${msg}`);
+    }
+    const data = (await res.json()) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error("Gemini vision generateContent returned no text.");
+    return text.trim();
   }
 }

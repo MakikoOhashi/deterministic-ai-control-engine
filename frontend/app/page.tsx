@@ -101,7 +101,7 @@ export default function Home() {
   const [question, setQuestion] = useState("");
   const [choices, setChoices] = useState<string[]>([]);
   const [correctIndex, setCorrectIndex] = useState<number | null>(null);
-  const [taskType, setTaskType] = useState<TaskType>("guided_reading");
+  const [taskType, setTaskType] = useState<TaskType>("context_completion");
   const [typedAnswer, setTypedAnswer] = useState("");
   const [contextSlots, setContextSlots] = useState<BlankSlot[]>([]);
   const [contextAnswers, setContextAnswers] = useState<string[]>([]);
@@ -156,6 +156,33 @@ export default function Home() {
       .replace(/\n{3,}/g, "\n\n")
       .trim();
 
+  const fileToResizedBase64 = async (file: File, maxSide = 1024) => {
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("Failed to read image."));
+      reader.readAsDataURL(file);
+    });
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Failed to decode image."));
+      image.src = dataUrl;
+    });
+    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+    const width = Math.max(1, Math.round(img.width * scale));
+    const height = Math.max(1, Math.round(img.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Failed to create canvas context.");
+    ctx.drawImage(img, 0, 0, width, height);
+    const output = canvas.toDataURL("image/jpeg", 0.85);
+    const base64 = output.split(",")[1] || "";
+    return { base64, mimeType: "image/jpeg" };
+  };
+
   const runInternalPreprocess = async (): Promise<string | null> => {
     let input = baselineSources.trim();
     if (!input && !ocrFile) {
@@ -163,9 +190,35 @@ export default function Home() {
       return null;
     }
 
+    let visionSlots:
+      | Array<{ prefix?: string; missingCount?: number; confidence?: number }>
+      | undefined;
+
     if (ocrFile) {
       setOcrLoading(true);
       try {
+        try {
+          const resized = await fileToResizedBase64(ocrFile, 1024);
+          const visionRes = await fetch(`${apiBase}/vision/extract-slots`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              imageBase64: resized.base64,
+              mimeType: resized.mimeType,
+              maxSlots: 6,
+            }),
+          });
+          if (visionRes.ok) {
+            const v = (await visionRes.json()) as {
+              slots?: Array<{ prefix?: string; missingCount?: number; confidence?: number }>;
+            };
+            if (Array.isArray(v.slots) && v.slots.length > 0) {
+              visionSlots = v.slots;
+            }
+          }
+        } catch {
+          // Vision extraction is best-effort in v1.
+        }
         const tesseract = await import("tesseract.js");
         const result = await tesseract.recognize(ocrFile, ocrLang);
         const normalized = normalizeOcrText(result.data.text || "");
@@ -184,6 +237,7 @@ export default function Home() {
         body: JSON.stringify({
           text: input,
           preferredTaskType: taskType,
+          visionSlots,
         }),
       });
       if (!res.ok) {
@@ -371,6 +425,7 @@ export default function Home() {
       const normalizedSource = await runInternalPreprocess();
       if (!normalizedSource) return;
       const nextTarget = await handleSetTarget(normalizedSource);
+      if (!nextTarget) return;
       await handleGenerate(nextTarget, normalizedSource);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
