@@ -42,17 +42,17 @@ LLMは候補生成器。最終採用は評価側で決定。
 
 ```mermaid
 flowchart TD
-  A[User Upload or Paste] --> B[OCR + Vision]
-  B --> C[/ocr/structure]
-  C --> C1[payload]
-  C --> C2[debug]
-  C1 --> D[/target/from-sources*]
-  D --> E[target mean + targetBand + axisTolerance]
-  E --> F[/generate/fill-blank or /generate/mc]
-  F --> G[Format Validation]
-  G --> H[Similarity/Jaccard + Difficulty Distance + Reuse Check]
-  H -->|pass| I[Return Generated Item]
-  H -->|fail| J[Repair or Reject]
+  A["User Upload or Paste"] --> B["OCR + Vision"]
+  B --> C["ocr_structure"]
+  C --> C1["payload"]
+  C --> C2["debug"]
+  C1 --> D["target_from_sources"]
+  D --> E["target mean + targetBand + axisTolerance"]
+  E --> F["generate_fill_blank or generate_mc"]
+  F --> G["Format Validation"]
+  G --> H["Similarity + Difficulty Distance + Reuse Check"]
+  H -->|pass| I["Return Generated Item"]
+  H -->|fail| J["Repair or Reject"]
 ```
 
 ---
