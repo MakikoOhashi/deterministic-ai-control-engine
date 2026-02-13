@@ -57,6 +57,137 @@ flowchart TD
 
 ---
 
+## Execution Spec（Upload → Generation）
+
+### 1. User Input
+- `ocrFile`（画像）または `baselineSources`（テキスト）
+- `taskType`（`context_completion` / `guided_reading`）
+
+### 2. Frontend Image Preprocess
+- 関数: `fileToResizedBase64(file, 1024)`
+- 目的: 長辺 1024px に縮小して推論コストを削減
+- API: `POST /vision/extract-slots`
+- 使用項目: `slots[]`（`prefix`, `missingCount`, `confidence`）
+
+### 3. OCR
+- 関数: `tesseract.recognize(...)`
+- 正規化: `normalizeOcrText(...)`
+- 結果テキストを次段の `/ocr/structure` へ渡す
+
+### 4. Structure Build（`POST /ocr/structure`）
+
+入力:
+- `text`
+- `preferredTaskType`
+- `visionSlots`（任意）
+
+内部処理（backend）:
+- `normalizePrefixUnderscorePatterns`
+- `classifyFormat`
+- `extractBlankSlots`
+- 必要時: LLM補正（`generationProvider.generateText`）
+- 必要時: regex fallback
+
+出力は `payload` / `debug` を分離:
+
+```json
+{
+  "payload": {
+    "taskType": "context_completion",
+    "format": "prefix_blank",
+    "displayText": "... fa__ ...",
+    "sourceAnswerKey": ["fail"],
+    "slotCount": 1,
+    "slots": [
+      { "prefix": "fa", "missingCount": 2, "slotConfidence": 0.82 }
+    ],
+    "textFeatures": {
+      "wordCount": 48,
+      "textLengthBucket": "short",
+      "cefr": "B2",
+      "lexical": 0.31,
+      "structural": 0.28
+    }
+  },
+  "debug": {
+    "rawOcrText": "...",
+    "aiNormalizedText": "...",
+    "normalizedText": "...",
+    "slotInference": "vision_ai"
+  }
+}
+```
+
+Frontendで使うのは原則 `payload`:
+- `payload.displayText` → 生成入力の基準テキスト
+- `payload.sourceAnswerKey` → 再利用禁止用 `sourceAnswers`
+
+### 5. Target Build（`POST /target/from-sources`）
+
+入力:
+- `sourceTexts[]`
+
+出力:
+- `mean`, `std`
+- `axisTolerance`
+- `targetBand`（`min/max`）
+- `effectiveTolerance`
+- `stability`
+
+`count=1` のときは点ではなく帯（range）重視で判定。
+
+### 6. Generation（`POST /generate/fill-blank`）
+
+入力:
+- `sourceText`
+- `target`（`L/S/A/R`）
+- `sourceAnswers`（`sourceAnswerKey`）
+
+内部処理:
+- Step A: 空欄なし全文を生成（LLM）
+- Step B: 空欄化語を選定（LLM, JSON）
+- Step C: `buildBlankedCandidateFromFullText` で決定論的に空欄化
+- Step D: 評価（format / similarity / jaccard / difficulty distance / reuse）
+
+返却（成功時）:
+
+```json
+{
+  "item": { "text": "... fa__ ...", "correct": "fame" },
+  "answers": ["fame"],
+  "similarity": 0.72,
+  "jaccard": 0.22,
+  "runId": "...",
+  "sourceId": "...",
+  "candidateId": "...",
+  "debug": { "stage": "accepted" }
+}
+```
+
+失敗時:
+- `errorType`: `VALIDATION_FAILED` / `SIMILARITY_REJECTED` / `NO_CANDIDATE`
+- `debug.stage`, `debug.llmLastValidationReason` で失敗段階を追跡
+
+### 7. Audit（`POST /difficulty/overall`）
+- 生成問題に対して `L/S/A/R/D` を再計測
+- UIの `Difficulty Stability Console` に表示
+
+### 8. Responsibility Split
+
+AI利用:
+- `/vision/extract-slots`
+- `/ocr/structure` のOCR補正
+- `/generate/fill-blank` の Step A / Step B
+
+決定論（関数）:
+- 正規化・抽出: `normalizePrefixUnderscorePatterns`, `extractBlankSlots`
+- 空欄化: `buildBlankedCandidateFromFullText`
+- 検証: `validateGenerated`
+- 評価: similarity / jaccard / difficulty
+- 再利用語reject: `sourceAnswers` 正規化比較
+
+---
+
 ## Context Completion フロー（詳細）
 
 ### Step A

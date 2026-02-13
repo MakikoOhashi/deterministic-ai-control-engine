@@ -1277,6 +1277,33 @@ app.post("/generate/fill-blank", async (req, res) => {
       }
     }
 
+    // Prefer deterministic output over free-form LLM rewrite when possible.
+    // This avoids invalid pseudo-answers (e.g., non-words) from legacy fallback prompts.
+    const deterministicFallback = scored.find(
+      (s) => validateGenerated(s.item.text, format, { expectedBlankCount }).ok
+    );
+    if (deterministicFallback) {
+      const slots = extractBlankSlots(deterministicFallback.item.text);
+      stage = "accepted";
+      return res.json({
+        item: deterministicFallback.item,
+        displayText: deterministicFallback.item.text,
+        answerKey: [deterministicFallback.item.correct],
+        answers: [deterministicFallback.item.correct],
+        slots,
+        candidates: scored,
+        format,
+        similarity: deterministicFallback.similarity,
+        jaccard: deterministicFallback.jaccard,
+        similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+        similarityWarning: "Returned deterministic candidate outside similarity range.",
+        runId,
+        sourceId,
+        candidateId: `${runId}:deterministic-fallback:0`,
+        debug: { stage },
+      });
+    }
+
     let llmAttempted = false;
     let llmLastSim: number | null = null;
     let llmLastJaccard: number | null = null;
@@ -1437,36 +1464,37 @@ app.post("/generate/fill-blank", async (req, res) => {
         }
 
         if (format === "prefix_blank" && pattern && expectedBlankCount === 1) {
-          const expectedLen = pattern.prefix.length + pattern.blankCount;
           const rawAnswer = String(answerList[0] || "").trim();
           const lowerPrefix = pattern.prefix.toLowerCase();
           const rawOriginal = String((parsed as { original?: string }).original || "").trim();
           let fullAnswer = rawAnswer;
           if (rawAnswer.toLowerCase().startsWith(lowerPrefix)) {
             fullAnswer = rawAnswer;
-          } else if (rawAnswer.length >= pattern.blankCount) {
-            const suffix = rawAnswer.slice(0, pattern.blankCount);
+          } else if (rawAnswer.length > 0) {
+            // If model returned only missing part, prepend prefix.
+            // Do not force legacy blank length here; keep generation flexible and align blank later.
+            const suffix = rawAnswer.slice(0, Math.max(rawAnswer.length, 1));
             fullAnswer = `${pattern.prefix}${suffix}`;
           } else {
             llmLastValidationReason = "Answer does not start with required prefix.";
             continue;
           }
-          if (fullAnswer.length !== expectedLen) {
-            llmLastValidationReason = "Answer length does not match blank length.";
-            continue;
-          }
+          rewritten = harmonizeSingleBlankWithAnswer(
+            rewritten,
+            "prefix_blank",
+            fullAnswer,
+            pattern
+          );
           answerList = [fullAnswer];
-          if (!rawOriginal) {
-            llmLastValidationReason = "LLM did not provide original answer.";
-            continue;
-          }
-          const normalizedOriginal = rawOriginal.toLowerCase();
-          const originalFull = normalizedOriginal.startsWith(lowerPrefix)
-            ? normalizedOriginal
-            : `${lowerPrefix}${normalizedOriginal}`;
-          if (answerList[0].toLowerCase() === originalFull) {
-            llmLastValidationReason = "Answer reused the original word.";
-            continue;
+          if (rawOriginal) {
+            const normalizedOriginal = rawOriginal.toLowerCase();
+            const originalFull = normalizedOriginal.startsWith(lowerPrefix)
+              ? normalizedOriginal
+              : `${lowerPrefix}${normalizedOriginal}`;
+            if (answerList[0].toLowerCase() === originalFull) {
+              llmLastValidationReason = "Answer reused the original word.";
+              continue;
+            }
           }
         }
         if (answerList.length === 0) {
