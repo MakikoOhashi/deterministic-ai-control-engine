@@ -1,515 +1,226 @@
-# Deterministic AI Evaluation Engine
+# Difficulty Evaluation-Guided Generation Engine
 
 ## 概要
+本プロジェクトは、英語学習向け問題を **LLM生成 + 評価関数** で安定化する実験実装です。  
+主眼は「問題生成」そのものではなく、**生成物の採否を評価で決めること**です。
 
-本プロジェクトは、LLM（大規模言語モデル）を単なるテキスト生成器ではなく、**評価設計に基づいて採用可否を判定する生成エンジン**として扱うための実証プロジェクトである。
-
-ユーザーが**選択肢形式で入力した問題に対し、類題を生成**する。
-対象領域は特定試験に依存しない汎用的な問題生成だが、本質は教育アプリではない。
-
-目的は以下である：
-
-* 生成の再現性を高める
-* 難易度を定量化する
-* 類似問題の重複を数学的に排除する
-* セッション体験のドリフトを検出する
+- 固有試験ブランドには依存しない
+- 画像入力（OCR/Vision）とテキスト入力の両方を扱う
+- 難易度を L/S/A/R/D で定量化
+- 類似度・形式・再利用語チェックで不適切生成を reject
 
 ---
 
-## 設計思想
+## 現在の対応タスク
+- `Context Completion`（空欄補充）
+- `Guided Reading`（短文読解 + 選択肢）
 
-### 1. LLMは「候補生成器」に過ぎない
-
-生成そのものはLLMが行うが、採用可否は評価エンジンが判断する。
-
-生成と評価を明確に分離する。
-
-```
-LLM → 候補生成
-Evaluation Engine → 検証・評価・採用判定
-```
+> `Mode B (Concept Preservation)` は将来拡張として設計のみ。v1の主軸は `Mode A`。
 
 ---
 
-### 2. Provider非依存設計
+## コア設計
 
-LLMは抽象化レイヤーを介して接続する。
+### Evaluation-first
+LLMは候補生成器。最終採用は評価側で決定。
 
-```
-/providers
-  gradient.provider.ts
-  openai.provider.ts
-```
+1. 生成（Generate）
+2. 検証（Format / Similarity / Difficulty / Reuse）
+3. 採用 or Reject
 
-将来的に：
+### payload / debug 分離
+`/ocr/structure` は以下を分離して返します。
 
-* DigitalOcean Gradient
-* OpenAI
-* 自前モデル
-* 他クラウド
+- `payload`: 生成に必要な最小情報（本番利用）
+- `debug`: 生OCR/整形結果などの観測情報（監査・開発用）
 
-いずれに変更しても評価ロジックは変更不要。
+これにより「どの中間表現を正とするか」の混乱を避けます。
 
 ---
 
-### 3. 評価レイヤー構造
+## Pipeline（現行）
 
-#### ① Semantic Guardrail（類似度評価）
-
-* Embedding生成
-* pgvector保存
-* cosine similarity検索
-* 閾値超過時は再生成
-
-目的：問題の重複を確率ではなく数値で評価し、採用可否を決定する。
-
----
-
-#### ② Difficulty Quantification（難易度定量化）
-
-難易度をLLM評価に依存しない。
-
-指標例：
-
-* 文長
-* 構文深度
-* 選択肢間semantic距離
-* 推論段階数
-
-出力：
-
-```
-difficultyScore = weighted composite metric
+```mermaid
+flowchart TD
+  A[User Upload or Paste] --> B[OCR + Vision]
+  B --> C[/ocr/structure]
+  C --> C1[payload]
+  C --> C2[debug]
+  C1 --> D[/target/from-sources*]
+  D --> E[target mean + targetBand + axisTolerance]
+  E --> F[/generate/fill-blank or /generate/mc]
+  F --> G[Format Validation]
+  G --> H[Similarity/Jaccard + Difficulty Distance + Reuse Check]
+  H -->|pass| I[Return Generated Item]
+  H -->|fail| J[Repair or Reject]
 ```
 
 ---
 
-##### Difficulty Quantification Model 設計原則
+## Context Completion フロー（詳細）
 
-本プロジェクトにおける難易度（difficulty）は主観評価ではなく、観測可能な構造的特徴量の合成指標として定義する。
+### Step A
+空欄なしの全文を生成（LLM）
 
-難易度は以下4軸に分解される：
+### Step B
+その全文から空欄にする語を選定（LLM, JSON）
 
-* Lexical Complexity（語彙難易度）
-* Structural Complexity（構文深度）
-* Semantic Ambiguity（選択肢の紛らわしさ）
-* Reasoning Depth（推論段階数）
+### Step C
+空欄化はコード側で決定論的に実施
 
-各指標は 0〜1 に正規化され、最終的に重み付き線形結合で統合される。
+- prefixあり/なしを保持
+- blank長は実語長から算出
 
-##### 正規化方針（0〜1スケール）
+### Step D
+評価関数で採否判定
 
-すべての指標は以下の Min-Max 正規化を使用する：
-
-```
-X_norm = (X - X_min) / (X_max - X_min)
-```
-
-設定方法
-
-* 初期値は理論上想定される範囲で固定する
-* 将来的には観測データ分布に基づき更新可能
-
-例：
-
-| 指標 | Xmin | Xmax |
-| --- | --- | --- |
-| 単語数 | 5 | 150 |
-| 文数 | 1 | 10 |
-| 推論段階 | 1 | 5 |
-
-これにより difficultyScore は常に 0〜1 に収束する。
-
-##### 各構成要素の理論整理
-
-1. Lexical Complexity（L）
-
-定義
-
-* 単語数（word_count）
-* 平均単語長（avg_word_length）
-
-理論背景
-
-語彙量と単語長は処理負荷と相関する。
-短文かつ単純語彙は認知負荷が低い。
-
-定義式
-
-```
-L = 0.5 * WC_norm + 0.5 * AWL_norm
-```
-
-均等重みの理由
-
-* 同一の lexical axis に属する
-* 相関はあるが完全一致しないため分離
-
-2. Structural Complexity（S）
-
-定義
-
-* 文の数（sentence_count）
-* 接続詞数（conjunction_count）
-* 従属節指標（簡易：接続詞ベース）
-
-理論背景
-
-構文が深いほどワーキングメモリ負荷が増大する。
-
-定義式
-
-```
-S = 0.6 * Clause_norm + 0.4 * Sentence_norm
-```
-
-重みの理由
-
-* 従属節数は構文深度をより直接的に反映
-* 文数は補助指標
-
-3. Semantic Ambiguity（A）
-
-定義
-
-正解選択肢と誤答選択肢間の embedding 距離に基づく。
-
-手順
-
-* 各選択肢の embedding を生成
-* 正解と各誤答の cosine similarity を算出
-* 平均類似度を計算
-
-```
-A = (1 / n) * sum(cosine_similarity(correct, distractor_i))
-```
-
-解釈
-
-* 類似度が高いほど紛らわしい
-* 値はすでに 0〜1 範囲
-* 正規化不要
-
-理論的意義
-
-Semantic距離が近いほど判別困難性が増す。
-これは識別難易度の直接的代理指標である。
-
-4. Reasoning Depth（R）
-
-定義
-
-問題解決に必要な推論ステップ数。
-
-推定方法
-
-* LLMに構造抽出のみ依頼（生成評価ではない）
-* 「最小推論段階数」を出力させる
-* 数値を正規化
-
-推論段階定義
-
-* 最短で正解に到達するために必要な推論の段数
-* 事実抽出 → 結合 → 含意判定 などの連鎖を1段と数える
-
-正規化式
-
-```
-R = min(steps / maxSteps, 1)
-```
-
-上限値の根拠
-
-* 初期値は試験問題の設計想定レンジに合わせて `maxSteps = 5` とする
-* 実データの分布に応じて将来的に更新可能
-
-理論的意義
-
-多段階推論は処理負荷増加と相関する。
-
-将来NLP自動推定予定
-
-##### 最終難易度スコア
-
-```
-Difficulty = 0.20L + 0.20S + 0.30A + 0.30R
-```
-
-重みの理論根拠
-
-なぜ A/R を 0.30 とするか
-
-本プロジェクトの中心思想は：
-
-* LLM生成を評価可能にすること
-
-Semantic Ambiguity / Reasoning Depth は：
-
-* ベクトルDBを活用
-* 数学的に再現可能
-* 本プロジェクトの差別化要素
-
-そのため難易度の中核として最も重い重みを与える。
-
-なぜ L/S は 0.20 か
-
-Lexical / Structural / Reasoning は：
-
-* 認知負荷の異なる側面を測定
-* 相互相関が存在する可能性がある
-* 単独で支配的ではない
-
-よって均等重みとする。
-
-将来的に、ユーザー正答率やIRTパラメータに基づき重みを学習的に最適化する。
-
-スコア特性
-
-* 出力範囲：0〜1
-* 0に近い → 易しい
-* 1に近い → 難しい
-* 再現可能
-* LLM非依存
-* 拡張可能性
-
-将来的に：
-
-* IRTパラメータ統合
-* 実ユーザー正答率統合
-* 動的重み最適化
-
-が可能。
-
-現段階では理論駆動型 difficulty model として実装する。
-
-ここまでがREADME定義。
-
-##### Target Profile（観測ベースライン）
-
-Target profile is derived from internally constructed baseline assessment items (non-proprietary).
-Each baseline item is evaluated to produce (L, S, A, R), and the target is the mean vector across items:
-
-```
-T = (1 / N) * sum(v_i), where v_i = (L_i, S_i, A_i, R_i)
-```
-
-This target is configurable and not tied to proprietary data.
-将来的に学習データに基づいて更新可能とする。
-
-#### ③ Session Drift Detection（体験ドリフト）
-
-セッション単位で：
-
-* 正答率変動
-* 回答時間標準偏差
-* トピック偏り
-
-出力：
-
-```
-driftIndex
-```
-
-目的：飽き・詰まり・難易度不整合の検出。
+- format
+- similarity / jaccard
+- difficulty distance
+- source answer reuse
 
 ---
 
-## アーキテクチャ
+## Difficulty モデル
 
+### 軸
+- `L`: Lexical Complexity
+- `S`: Structural Complexity
+- `A`: Semantic Ambiguity
+- `R`: Reasoning Depth
+
+### 統合
+`D = 0.20L + 0.20S + 0.30A + 0.30R`
+
+### Target の扱い
+`/target/from-sources` は以下を返却:
+
+- `mean`
+- `std`
+- `axisTolerance`
+- `targetBand(min/max)`
+- `effectiveTolerance`
+- `stability`
+
+`count=1` の場合は点推定ではなく **帯（range）重視** で判定します。
+
+---
+
+## 主な API
+
+### 入力解析
+- `POST /ocr/extract` 画像OCR
+- `POST /vision/extract-slots` 画像から slot 構造抽出
+- `POST /ocr/structure` payload/debug 分離構造化
+
+### ターゲット計算
+- `POST /target/from-sources`（Context Completion）
+- `POST /target/from-sources-mc`（Guided Reading）
+
+### 生成
+- `POST /generate/fill-blank`
+- `POST /generate/mc`
+
+### 評価
+- `POST /difficulty/overall`
+- `GET /difficulty/weights`
+
+---
+
+## 主要レスポンス例
+
+### `/ocr/structure`（抜粋）
+```json
+{
+  "payload": {
+    "taskType": "context_completion",
+    "format": "prefix_blank",
+    "displayText": "... fa__ ...",
+    "sourceAnswerKey": ["fail"],
+    "slotCount": 1,
+    "slots": [{ "prefix": "fa", "missingCount": 2, "slotConfidence": 0.82 }],
+    "textFeatures": { "wordCount": 48, "textLengthBucket": "short", "cefr": "B2", "lexical": 0.31, "structural": 0.28 }
+  },
+  "debug": {
+    "rawOcrText": "...",
+    "aiNormalizedText": "...",
+    "normalizedText": "..."
+  }
+}
 ```
-[ Next.js UI ]
-        ↓
-[ REST API Layer ]
-        ↓
-[ Evaluation Engine ]
-        ↓
-[ LLM Provider Layer ]
-        ↓
-[ LLM Inference ]
-        
-[ PostgreSQL + pgvector ]
+
+### `/generate/fill-blank`（抜粋）
+```json
+{
+  "item": { "text": "... fa__ ...", "correct": "fame" },
+  "answers": ["fame"],
+  "similarity": 0.72,
+  "jaccard": 0.22,
+  "runId": "...",
+  "sourceId": "...",
+  "candidateId": "...",
+  "debug": { "stage": "accepted" }
+}
+```
+
+失敗時は:
+
+```json
+{
+  "errorType": "VALIDATION_FAILED",
+  "debug": {
+    "stage": "validation_failed",
+    "llmLastValidationReason": "Expected exactly 1 blank."
+  }
+}
 ```
 
 ---
 
-## 現状整理（実装済み）
+## フロント実装方針（現行）
 
-### 1. 生成フロー（Multiple Choice固定）
+- 上段: 学習者向け操作（入力・生成・回答）
+- 下段: `Difficulty Stability Console`（監査）
 
-入力：
-
-* ユーザーが貼った問題文（Passage + Question + Choices）
-* Mode A（Cognitive Match）
-* Target profile（L/S/A/R）
-
-処理：
-
-1. **入力の正規化・パース**
-   * 末尾の選択肢ブロックを検出し、Passage / Question / Choices に分解
-   * 日本語の「ア〜エ + アイ/アウ…」形式を Combo として扱う
-2. **Passage生成（Passageが存在する場合）**
-   * Passageは別リクエストで生成し、**固定化して使用**
-   * 生成が失敗した場合は、**元のPassageをフォールバック**として採用
-3. **Question/Choices生成**
-   * Mode A: 1候補
-4. **検証**
-   * フォーマット検証（Choice数、QuestionにChoiceが混入していないか）
-   * Similarity/Jaccard閾値チェック
-5. **採用**
-   * 最初に条件を満たした候補を採用
+Console では以下を表示:
+- Compliance
+- Target D / Current D / Distance
+- Target Range（L/S/A/R）
+- Axis Table
+- Similarity（必要時）
+- `debug.stage`, `runId`, `sourceId`
 
 ---
 
-### 2. モード方針
+## 制約（v1）
 
-**Mode A（Cognitive Match）**
-
-* トピックは変わっても良い
-* 目的は難易度プロファイル（L/S/A/R）の一致
-* 監査指標は「選択肢内部構造」が中心
-
-**Mode B（Concept Preservation）**
-
-* 将来実装（v1では未実装）
-* 仕様案として README にのみ記載
-
----
-
-### 3. Similarity分解（監査用）
-
-Similarityは1つの数値ではなく以下に分解して計測：
-
-* Passage similarity
-* Question similarity
-* Correct choice similarity
-* Distractors similarity
-* Overall choices similarity
-
-Mode Aは **Choice Structure Score** を表示：
-
-* 正答 vs 誤答距離
-* 誤答同士の距離分散
-* 正答の孤立度
-
----
-
-### 4. UI（現状）
-
-* Top: 入力 + Set Target + Generate
-* Generated Question 表示
-* Submit Answer / Run Audit
-* 下部に折りたたみ式 **Difficulty Stability Console**
-  * Difficulty指標（L/S/A/R/D）
-  * Similarity breakdown
-  * Choice structure監査指標
-
----
-
-### 5. 既存API
-
-* `POST /target/from-sources-mc`  
-  Baseline問題から Target profile を算出（平均 + stability + tolerance）
-
-* `POST /generate/mc`  
-  Multiple Choice生成（Mode Aのみ）
-
-* `POST /difficulty/overall`  
-  L/S/A/R/D を算出
-
----
-
-### 6. 現在の制限
-
-* Mode Aは **トピック変更が前提**（能力測定型）
-* Mode Bは将来実装（現時点ではAPIで無効）
-* Passage生成は長さ範囲に収まらない場合があるため、
-  フォールバック（元Passage使用）を許容
-* 多形式（Fill blank / constructed response）は現在対象外
-
+- OCR品質が極端に低い画像では slot抽出が不安定
+- `Context Completion` は現在 1〜2 blanks を優先
+- `Mode B` は未実装（READMEの将来計画）
 
 ---
 
 ## 技術スタック
 
 ### Backend
-
-* Node.js
-* TypeScript (ESM)
-* Express
-* Prisma
-* PostgreSQL + pgvector
+- Node.js / TypeScript / Express
+- Embedding Provider（Dummy / Gemini）
+- Gemini Text Generation Provider
 
 ### Frontend
+- Next.js 14
+- React + useState（軽量構成）
 
-* Next.js
-* Evaluation Metrics Visualization
-
-### Infrastructure
-
-* DigitalOcean App Platform
-* DigitalOcean Managed PostgreSQL
-* DigitalOcean Gradient Inference
+### Infra（想定）
+- DigitalOcean App Platform
+- Managed DB / Vector拡張（将来）
 
 ---
 
-## ディレクトリ構造
+## 目的の再定義
 
-```
-/backend
-  /src
-    /controllers
-    /services
-    /providers
-    /routes
-    index.ts
+本プロジェクトは「教育アプリUI」よりも、
 
-/frontend
-/docker
-```
+**Evaluation-Guided Generation（評価設計駆動の生成制御）**
 
----
-
-## 設計手順（開発プロセス）
-
-1. ベクトル保存と類似検索の実装
-2. 類似度閾値評価ループの完成
-3. 問題生成API完成
-4. 難易度算出ロジック追加
-5. ドリフト検出実装
-6. UIで評価メトリクス可視化
-7. LLMをGradientへ切替
-8. DO環境へデプロイ
-
----
-
-## このプロジェクトが解決する問題
-
-従来のLLM活用型教育アプリは：
-
-* 生成が不安定
-* 難易度が曖昧
-* 問題が重複する
-* セッション体験が評価不能
-
-本プロジェクトは、「生成AIを評価可能なシステムへ変換する」ことを目的とする。
-
----
-
-## 拡張可能性
-
-本設計は以下に応用可能：
-
-* 医療QA生成の評価設計
-* 法律問題生成の評価設計
-* 企業研修AIの評価設計
-* SaaS型Adaptive Testing Engine
-
----
-
-## 非目標（Out of Scope）
-
-* UIの高度化
-* 本格的な課金機能
-* 完全適応型試験エンジン
-
-本プロジェクトは「評価インフラの実証」に集中する。
+を実証するためのエンジンです。

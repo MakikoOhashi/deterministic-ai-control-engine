@@ -3,7 +3,7 @@ import type { ProblemFormat } from "./format-classifier.service.js";
 const BLANK_REGEX = /(_\s*){2,}/g;
 const MC_REGEX = /^\s*(A|B|C|D)[\).]/m;
 // Accept both "fa__" and spaced variants like "fa _ _".
-const PREFIX_REGEX = /\b[A-Za-z]{1,5}\s*(?:_\s*){2,}\b/;
+const PREFIX_REGEX = /[A-Za-z]{1,5}\s*(?:_\s*){2,}/g;
 
 export function validateGenerated(
   text: string,
@@ -15,7 +15,7 @@ export function validateGenerated(
 } {
   const hasMC = MC_REGEX.test(text);
   const blanks = text.match(BLANK_REGEX) || [];
-  const hasPrefix = PREFIX_REGEX.test(text);
+  const hasPrefix = (text.match(PREFIX_REGEX) || []).length > 0;
   const expectedBlankCount = opts?.expectedBlankCount ?? 1;
 
   if (format === "multiple_choice") {

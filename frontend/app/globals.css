@@ -183,6 +183,16 @@ textarea {
   background: #e0f2fe;
 }
 
+.blank-input {
+  width: 24px;
+  padding: 0;
+  margin: 0;
+  outline: none;
+  text-align: center;
+  border: 2px solid #cbd5e1;
+  background: #f8fafc;
+}
+
 .actions button {
   min-width: 180px;
 }

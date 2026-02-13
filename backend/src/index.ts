@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import { createHash, randomUUID } from "node:crypto";
 import { semanticAmbiguityA } from "./services/difficulty.service.js";
 import {
   DummyEmbeddingProvider,
@@ -472,6 +473,16 @@ function textLengthBucket(text: string): "short" | "medium" {
   return count <= 90 ? "short" : "medium";
 }
 
+function clamp01(v: number) {
+  return Math.max(0, Math.min(1, v));
+}
+
+function computeAxisTolerance(meanVal: number, stdVal: number, count: number) {
+  const base = count <= 1 ? 0.12 : count === 2 ? 0.08 : 0.05;
+  const adaptive = stdVal > 0 ? stdVal * 1.5 : base;
+  return Math.min(Math.max(Math.max(base, adaptive), 0.03), 0.25);
+}
+
 function buildContextSnippet(
   text: string,
   start: number,
@@ -637,6 +648,107 @@ function reconstructBlankDisplayFromAi(
   return { displayText: output, answerKey };
 }
 
+function harmonizeSingleBlankWithAnswer(
+  text: string,
+  format: "full_blank" | "prefix_blank",
+  answer: string,
+  pattern?: { prefix: string; blanks: string; blankCount: number } | null
+): string {
+  const cleanAnswer = answer.replace(/\s+/g, "").trim();
+  if (!cleanAnswer) return text;
+  if (format === "prefix_blank" && pattern) {
+    const prefix = pattern.prefix;
+    const lowerPrefix = prefix.toLowerCase();
+    const normalizedAnswer = cleanAnswer.toLowerCase().startsWith(lowerPrefix)
+      ? cleanAnswer
+      : `${prefix}${cleanAnswer}`;
+    // Keep at least 2 underscores so validator/extractor treat it as a valid blank token.
+    const missing = Math.max(normalizedAnswer.length - prefix.length, 2);
+    const token = `${prefix}${"_".repeat(missing)}`;
+    return text.replace(/([A-Za-z]{1,5}\s*(?:_\s*){2,}|(?:_\s*){2,})/, token);
+  }
+  const token = "_".repeat(Math.max(cleanAnswer.length, 2));
+  return text.replace(/(?:_\s*){2,}/, token);
+}
+
+function buildBlankedCandidateFromFullText(
+  fullText: string,
+  slotRules: Array<{ prefix: string; missingCount: number }>,
+  expectedBlankCount: number,
+  chosenWords?: string[]
+): { text: string; answerKey: string[] } | null {
+  const words = getWordMatches(fullText);
+  if (words.length === 0) return null;
+
+  const used = new Set<number>();
+  const picked: Array<{ index: number; word: string; start: number; end: number; rule: { prefix: string; missingCount: number } }> = [];
+
+  const chooseWordForSlot = (slotIdx: number) => {
+    const rule = slotRules[slotIdx] || { prefix: "", missingCount: 2 };
+    const requested = String(chosenWords?.[slotIdx] || "").trim().toLowerCase();
+    let selectedIndex = -1;
+
+    if (requested) {
+      selectedIndex = words.findIndex(
+        (w, idx) =>
+          !used.has(idx) &&
+          w.word.toLowerCase() === requested &&
+          (!rule.prefix || w.word.toLowerCase().startsWith(rule.prefix.toLowerCase()))
+      );
+    }
+
+    if (selectedIndex < 0 && rule.prefix) {
+      selectedIndex = words.findIndex(
+        (w, idx) =>
+          !used.has(idx) &&
+          w.word.length >= Math.max(rule.prefix.length + 1, 4) &&
+          w.word.toLowerCase().startsWith(rule.prefix.toLowerCase())
+      );
+    }
+
+    if (selectedIndex < 0) {
+      selectedIndex = words.findIndex((w, idx) => !used.has(idx) && w.word.length >= 4);
+    }
+    if (selectedIndex < 0) return null;
+    used.add(selectedIndex);
+    const match = words[selectedIndex];
+    if (!match) return null;
+    picked.push({
+      index: selectedIndex,
+      word: match.word,
+      start: match.start,
+      end: match.end,
+      rule,
+    });
+    return true;
+  };
+
+  for (let i = 0; i < expectedBlankCount; i += 1) {
+    if (!chooseWordForSlot(i)) return null;
+  }
+
+  let out = fullText;
+  const answerKey: string[] = new Array(expectedBlankCount).fill("");
+  const sorted = [...picked].sort((a, b) => b.start - a.start);
+  for (const p of sorted) {
+    const slotIdx = picked.findIndex((x) => x.start === p.start && x.end === p.end);
+    const prefix = p.rule.prefix || "";
+    const lowerWord = p.word.toLowerCase();
+    let replacement = "";
+    if (prefix && lowerWord.startsWith(prefix.toLowerCase())) {
+      const missing = Math.max(lowerWord.length - prefix.length, 1);
+      replacement = `${prefix}${"_".repeat(missing)}`;
+    } else {
+      replacement = "_".repeat(Math.max(lowerWord.length, 2));
+    }
+    out = `${out.slice(0, p.start)}${replacement}${out.slice(p.end)}`;
+    if (slotIdx >= 0) answerKey[slotIdx] = lowerWord;
+  }
+
+  if (answerKey.some((a) => !a)) return null;
+  return { text: out, answerKey };
+}
+
 app.post("/ocr/structure", async (req, res) => {
   try {
     const { text, preferredTaskType, visionSlots } = req.body as {
@@ -674,9 +786,20 @@ app.post("/ocr/structure", async (req, res) => {
       ]
         .filter(Boolean)
         .join("\n\n");
-      return res.json({
+      const payload = {
         taskType,
-        format: "multiple_choice",
+        format: "multiple_choice" as const,
+        item: parsed,
+      };
+      const debug = {
+        rawOcrText,
+        aiNormalizedText: normalizedText,
+        normalizedText,
+      };
+      return res.json({
+        ...payload,
+        payload,
+        debug,
         rawOcrText,
         aiNormalizedText: normalizedText,
         normalizedText,
@@ -817,7 +940,38 @@ app.post("/ocr/structure", async (req, res) => {
       textLengthBucket: textLengthBucket(reconstructed.displayText),
       cefr: estimateCefrLevel(reconstructed.displayText),
     };
+    const payload = {
+      taskType,
+      format: classifyFormat(aiNormalizedText),
+      displayText: reconstructed.displayText,
+      sourceAnswerKey: answerKey,
+      slotCount: cappedSlots.length,
+      slots: cappedSlots.map((slot) => ({
+        prefix: slot.prefix,
+        missingCount: slot.missingCount,
+        slotConfidence: slot.slotConfidence,
+        contextSnippet: slot.contextSnippet,
+      })),
+      textFeatures: {
+        wordCount: countWords(reconstructed.displayText),
+        textLengthBucket: extraction.textLengthBucket,
+        cefr: extraction.cefr,
+        lexical: computeLexicalComplexity(reconstructed.displayText).L,
+        structural: computeStructuralComplexity(reconstructed.displayText).S,
+      },
+      extraction,
+    };
+    const debug = {
+      rawOcrText,
+      aiNormalizedText,
+      normalizedText: reconstructed.displayText,
+      slotInference,
+      structuredByFallbackLlm,
+    };
     return res.json({
+      ...payload,
+      payload,
+      debug,
       taskType,
       format: classifyFormat(aiNormalizedText),
       rawOcrText,
@@ -839,10 +993,11 @@ app.post("/ocr/structure", async (req, res) => {
 
 app.post("/generate/fill-blank", async (req, res) => {
   try {
-    const { sourceText, target, mode } = req.body as {
+    const { sourceText, target, mode, sourceAnswers } = req.body as {
       sourceText: string;
       target?: { L: number; S: number; A: number; R: number };
       mode?: "A" | "B";
+      sourceAnswers?: string[];
     };
     if (typeof sourceText !== "string") {
       return res.status(400).json({ error: "Expected { sourceText: string }" });
@@ -852,52 +1007,180 @@ app.post("/generate/fill-blank", async (req, res) => {
       .replace(/(?<=[A-Za-z])_{1,3}(?=[A-Za-z])/g, "")
       .replace(/\s{2,}/g, " ")
       .trim();
-    const format = classifyFormat(cleanedSourceText);
-    if (format === "multiple_choice" || format === "constructed_response") {
-      return res.status(400).json({ error: `Format ${format} not supported in v1.` });
+    const runId = randomUUID();
+    const sourceId = createHash("sha1").update(cleanedSourceText).digest("hex").slice(0, 12);
+    let stage:
+      | "source_received"
+      | "structure_loaded"
+      | "stepA_text_generated"
+      | "stepB_words_selected"
+      | "stepC_blank_built"
+      | "candidate_scored"
+      | "accepted"
+      | "validation_failed"
+      | "similarity_rejected" = "source_received";
+    const normalizeAnswerToken = (v: string) => String(v || "").replace(/\s+/g, "").toLowerCase();
+    const normalizedSourceAnswers = new Set(
+      (Array.isArray(sourceAnswers) ? sourceAnswers : [])
+        .map((a) => normalizeAnswerToken(String(a || "")))
+        .filter(Boolean)
+    );
+    const detectedFormat = classifyFormat(cleanedSourceText);
+    if (detectedFormat === "multiple_choice") {
+      return res.status(400).json({ error: `Format ${detectedFormat} not supported in v1.` });
     }
+    // If OCR/normalization dropped blank markers, fall back to full_blank instead of hard-failing.
+    const format = detectedFormat === "constructed_response" ? "full_blank" : detectedFormat;
     const extractedSlots = extractBlankSlots(cleanedSourceText).filter(
       (s) => s.prefix.length <= 4 && s.missingCount >= 1 && s.missingCount <= 8
     );
     // v1 cloze: keep generation flexible by limiting slot control to 1-2 blanks.
     const expectedBlankCount = Math.max(1, Math.min(extractedSlots.length || 1, 2));
-    const candidates = generateFillBlankCandidates(cleanedSourceText);
+    let candidates = generateFillBlankCandidates(cleanedSourceText);
     if (candidates.length === 0 && !generationProvider) {
       return res.status(422).json({
         error: "Could not generate a valid blank candidate from this source.",
       });
     }
     const sourceSlots = extractBlankSlots(cleanedSourceText);
+    stage = "structure_loaded";
+    // Canonicalize source answers for prefix blanks:
+    // If UI sends only missing letters (e.g. "il"), also register full form (e.g. "fail").
+    if (sourceSlots.length > 0 && normalizedSourceAnswers.size > 0) {
+      for (const slot of sourceSlots) {
+        if (!slot.prefix) continue;
+        const prefixNorm = normalizeAnswerToken(slot.prefix);
+        const answerSnapshot = Array.from(normalizedSourceAnswers);
+        for (const ans of answerSnapshot) {
+          if (!ans) continue;
+          if (ans.startsWith(prefixNorm)) continue;
+          if (ans.length === slot.missingCount) {
+            normalizedSourceAnswers.add(`${prefixNorm}${ans}`);
+          }
+        }
+      }
+    }
     const slotRules = (sourceSlots.length > 0 ? sourceSlots : extractedSlots)
       .slice(0, expectedBlankCount)
       .map((s) => ({
         prefix: s.prefix || "",
         missingCount: s.missingCount,
       }));
+    const sourceWordCount = countWords(cleanedSourceText);
+    const sourceBucket = textLengthBucket(cleanedSourceText);
+    const sourceCefr = estimateCefrLevel(cleanedSourceText);
+    const sourceLex = computeLexicalComplexity(cleanedSourceText).L;
+    const sourceStruct = computeStructuralComplexity(cleanedSourceText).S;
     const slotConstraintSummary =
       slotRules.length > 0
         ? slotRules
             .map((s) => `${s.prefix || "(none)"}:${s.missingCount}`)
             .join(", ")
         : "single_blank";
+
+    // v2 pipeline: A) generate full text first, B) ask LLM which words to blank, C) blank deterministically.
+    if (generationProvider) {
+      const genSystem =
+        "You generate English learning passages. Return ONLY valid JSON.";
+      const genPrompt = [
+        "Create one NEW paragraph/sentence for a context-completion item.",
+        "Do not include blanks, underscores, choices, or answers.",
+        "Use a different theme than the source text.",
+        `Target length bucket: ${sourceBucket} (source word count: ${sourceWordCount}).`,
+        `Target CEFR: ${sourceCefr}.`,
+        `Target lexical/structural style: L≈${sourceLex.toFixed(2)}, S≈${sourceStruct.toFixed(2)}.`,
+        expectedBlankCount > 1
+          ? `Write enough content to support ${expectedBlankCount} blanks naturally.`
+          : "Write enough content to support one meaningful blank.",
+        "Return JSON: {\"text\":\"...\"}",
+      ].join("\n");
+
+      for (let i = 0; i < 2; i += 1) {
+        const raw = await generationProvider.generateText(genPrompt, genSystem);
+        const parsed = extractJson(raw) as { text?: unknown } | null;
+        const fullText = String(parsed?.text || "").trim();
+        if (!fullText) continue;
+        if (/(?:_\s*){2,}/.test(fullText)) continue;
+        stage = "stepA_text_generated";
+
+        const pickSystem =
+          "You choose words to blank for cloze tasks. Return ONLY valid JSON.";
+        const pickPrompt = [
+          "Choose words from the text that should be blanked.",
+          `Need exactly ${expectedBlankCount} word(s).`,
+          slotRules.length > 0
+            ? `Slot constraints by index (prefix:missing): ${slotConstraintSummary}.`
+            : "No explicit slot constraints.",
+          "Each chosen word must appear exactly in the text.",
+          "Return JSON: {\"words\":[\"w1\",\"w2\"]}.",
+          `Text:\n${fullText}`,
+        ].join("\n");
+
+        const pickRaw = await generationProvider.generateText(pickPrompt, pickSystem);
+        const pickParsed = extractJson(pickRaw) as { words?: unknown[]; chosenWord?: unknown } | null;
+        const chosenWords =
+          Array.isArray(pickParsed?.words)
+            ? pickParsed!.words.map((w) => String(w || "").trim()).filter(Boolean)
+            : pickParsed?.chosenWord
+            ? [String(pickParsed.chosenWord).trim()]
+            : [];
+        if (chosenWords.length > 0) {
+          stage = "stepB_words_selected";
+        }
+
+        const blanked = buildBlankedCandidateFromFullText(
+          fullText,
+          slotRules,
+          expectedBlankCount,
+          chosenWords
+        );
+        if (!blanked) continue;
+        stage = "stepC_blank_built";
+        const firstAnswer = blanked.answerKey[0];
+        if (!firstAnswer) continue;
+        if (normalizedSourceAnswers.has(normalizeAnswerToken(firstAnswer))) continue;
+        const generatedCandidate = {
+          text: blanked.text,
+          correct: firstAnswer,
+          distractors: buildDistractorsFromText(fullText, firstAnswer),
+          steps: sourceWordCount >= 12 ? 2 : 1,
+        };
+        candidates = [generatedCandidate, ...candidates];
+        break;
+      }
+    }
     if (!target) {
       if (candidates.length === 0) {
+        stage = "validation_failed";
         return res.status(422).json({
           error: generationProvider
             ? "Could not build deterministic candidates. Please retry."
             : "Could not generate a valid blank candidate from this source.",
+          runId,
+          sourceId,
+          debug: { stage },
         });
       }
       const valid = candidates.find(
-        (c) => validateGenerated(c.text, format, { expectedBlankCount }).ok
+        (c) =>
+          validateGenerated(c.text, format, { expectedBlankCount }).ok &&
+          !normalizedSourceAnswers.has(normalizeAnswerToken(c.correct))
       );
-      const chosen = valid || candidates[0];
+      const nonReused = candidates.find(
+        (c) => !normalizedSourceAnswers.has(normalizeAnswerToken(c.correct))
+      );
+      const chosen = valid || nonReused || candidates[0];
       if (!chosen) {
+        stage = "validation_failed";
         return res.status(422).json({
           error: "Could not generate a valid blank candidate from this source.",
+          runId,
+          sourceId,
+          debug: { stage },
         });
       }
       const slots = extractBlankSlots(chosen.text);
+      stage = "accepted";
       return res.json({
         item: chosen,
         displayText: chosen.text,
@@ -906,12 +1189,19 @@ app.post("/generate/fill-blank", async (req, res) => {
         slots,
         candidates,
         format,
+        runId,
+        sourceId,
+        candidateId: `${runId}:deterministic:0`,
+        debug: { stage },
       });
     }
     const scored: Array<{ item: typeof candidates[number]; distance: number; similarity: number; jaccard: number }> = [];
     const normalizedSource = normalizeForSimilarity(cleanedSourceText);
     const sourceVec = await embeddingProvider.embedText(normalizedSource, 8);
     for (const c of candidates) {
+      if (normalizedSourceAnswers.has(normalizeAnswerToken(c.correct))) {
+        continue;
+      }
       const lexical = computeLexicalComplexity(c.text);
       const structural = computeStructuralComplexity(c.text);
       const correctVec = await embeddingProvider.embedText(c.correct, 8);
@@ -929,6 +1219,7 @@ app.post("/generate/fill-blank", async (req, res) => {
       const jaccard = tokenJaccard(normalizedSource, normalizedCandidate);
       scored.push({ item: c, distance: Math.sqrt(d), similarity, jaccard });
     }
+    stage = "candidate_scored";
     scored.sort((a, b) => a.distance - b.distance);
     // Cloze-specific thresholds:
     // - allow higher semantic similarity to keep same difficulty shape
@@ -968,6 +1259,7 @@ app.post("/generate/fill-blank", async (req, res) => {
         ) || null;
       if (best) {
         const slots = extractBlankSlots(best.item.text);
+        stage = "accepted";
         return res.json({
           item: best.item,
           answers: [best.item.correct],
@@ -977,6 +1269,10 @@ app.post("/generate/fill-blank", async (req, res) => {
           similarity: best.similarity,
           jaccard: best.jaccard,
           similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+          runId,
+          sourceId,
+          candidateId: `${runId}:best:0`,
+          debug: { stage },
         });
       }
     }
@@ -1057,6 +1353,44 @@ app.post("/generate/fill-blank", async (req, res) => {
         }
         let rewritten = parsed.text;
         rewritten = normalizePrefixUnderscorePatterns(rewritten);
+        const parsedAnswerRaw =
+          Array.isArray((parsed as { answers?: unknown }).answers) &&
+          (parsed as { answers: unknown[] }).answers.length > 0
+            ? String((parsed as { answers: unknown[] }).answers[0] || "").trim()
+            : (parsed as { answer?: unknown }).answer != null
+            ? String((parsed as { answer: unknown }).answer || "").trim()
+            : "";
+
+        // Auto-repair: if model forgets blank markers, inject one deterministically.
+        if (!/(_\s*){2,}/.test(rewritten) && expectedBlankCount === 1) {
+          if (format === "prefix_blank" && pattern) {
+            const token = `${pattern.prefix}${pattern.blanks}`;
+            if (parsedAnswerRaw) {
+              const escaped = parsedAnswerRaw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const ansRegex = new RegExp(`\\b${escaped}\\b`, "i");
+              if (ansRegex.test(rewritten)) {
+                rewritten = rewritten.replace(ansRegex, token);
+              } else {
+                rewritten = `${rewritten} ${token}`.trim();
+              }
+            } else {
+              rewritten = `${rewritten} ${token}`.trim();
+            }
+          } else {
+            const token = "____";
+            if (parsedAnswerRaw) {
+              const escaped = parsedAnswerRaw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const ansRegex = new RegExp(`\\b${escaped}\\b`, "i");
+              if (ansRegex.test(rewritten)) {
+                rewritten = rewritten.replace(ansRegex, token);
+              } else {
+                rewritten = `${rewritten} ${token}`.trim();
+              }
+            } else {
+              rewritten = `${rewritten} ${token}`.trim();
+            }
+          }
+        }
         if (format === "prefix_blank" && pattern && expectedBlankCount === 1) {
           const replacePrefixBlank = (input: string) => {
             const prefixBlankRegex = /([A-Za-z]+)\s*((?:_\s*){2,})/;
@@ -1070,6 +1404,23 @@ app.post("/generate/fill-blank", async (req, res) => {
             return input;
           };
           rewritten = replacePrefixBlank(rewritten);
+        }
+        if (expectedBlankCount === 1 && parsedAnswerRaw) {
+          if (format === "prefix_blank") {
+            rewritten = harmonizeSingleBlankWithAnswer(
+              rewritten,
+              "prefix_blank",
+              parsedAnswerRaw,
+              pattern
+            );
+          } else {
+            rewritten = harmonizeSingleBlankWithAnswer(
+              rewritten,
+              "full_blank",
+              parsedAnswerRaw,
+              null
+            );
+          }
         }
         const validation = validateGenerated(rewritten, format, { expectedBlankCount });
         if (!validation.ok) {
@@ -1146,6 +1497,12 @@ app.post("/generate/fill-blank", async (req, res) => {
           }
           if (!multiRuleOk) continue;
         }
+        if (
+          answerList.some((a) => normalizedSourceAnswers.has(normalizeAnswerToken(String(a || ""))))
+        ) {
+          llmLastValidationReason = "Answer reused from source.";
+          continue;
+        }
         const candidateVec = await embeddingProvider.embedText(
           normalizeForSimilarity(rewritten),
           8
@@ -1162,6 +1519,7 @@ app.post("/generate/fill-blank", async (req, res) => {
             steps: base.steps,
           };
           const slots = extractBlankSlots(generatedItem.text);
+          stage = "accepted";
           return res.json({
             item: generatedItem,
             displayText: generatedItem.text,
@@ -1173,6 +1531,10 @@ app.post("/generate/fill-blank", async (req, res) => {
             similarity: sim,
             jaccard,
             similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+            runId,
+            sourceId,
+            candidateId: `${runId}:llm:${i}`,
+            debug: { stage },
           });
         }
       }
@@ -1209,6 +1571,7 @@ app.post("/generate/fill-blank", async (req, res) => {
               steps: base.item.steps,
             };
             const slots = extractBlankSlots(repairedItem.text);
+            stage = "accepted";
             return res.json({
               item: repairedItem,
               displayText: repairedItem.text,
@@ -1221,6 +1584,10 @@ app.post("/generate/fill-blank", async (req, res) => {
               jaccard,
               repaired: true,
               similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
+              runId,
+              sourceId,
+              candidateId: `${runId}:repair:0`,
+              debug: { stage },
             });
           }
         }
@@ -1233,6 +1600,7 @@ app.post("/generate/fill-blank", async (req, res) => {
     );
     if (fallback) {
       const slots = extractBlankSlots(fallback.item.text);
+      stage = "accepted";
       return res.json({
         item: fallback.item,
         displayText: fallback.item.text,
@@ -1245,6 +1613,10 @@ app.post("/generate/fill-blank", async (req, res) => {
         jaccard: fallback.jaccard,
         similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
         similarityWarning: "Returned best candidate outside similarity range.",
+        runId,
+        sourceId,
+        candidateId: `${runId}:fallback:0`,
+        debug: { stage },
       });
     }
 
@@ -1254,14 +1626,18 @@ app.post("/generate/fill-blank", async (req, res) => {
         : scored.length > 0
         ? "SIMILARITY_REJECTED"
         : "NO_CANDIDATE";
+    stage = errorType === "VALIDATION_FAILED" ? "validation_failed" : "similarity_rejected";
     return res.status(422).json({
       error:
         errorType === "VALIDATION_FAILED"
           ? "Generated candidate failed format validation. Please retry."
           : "Generated problem too similar to source. Please try again.",
       errorType,
+      runId,
+      sourceId,
       similarityRange: { min: MIN_SIM, max: MAX_SIM, maxJaccard: MAX_JACCARD },
       debug: {
+        stage,
         llmAttempted,
         llmLastSim,
         llmLastJaccard,
@@ -1753,11 +2129,34 @@ app.post("/target/from-sources-mc", async (req, res) => {
       return Math.sqrt(variance);
     };
     const stability = count <= 1 ? "Low" : count === 2 ? "Medium" : "High";
-    const effectiveTolerance = count <= 1 ? 0.1 : count === 2 ? 0.07 : 0.05;
+    const effectiveTolerance = count <= 1 ? 0.12 : count === 2 ? 0.07 : 0.05;
+    const meanProfile = { L: mean(Ls), S: mean(Ss), A: mean(As), R: mean(Rs) };
+    const stdProfile = { L: std(Ls), S: std(Ss), A: std(As), R: std(Rs) };
+    const axisTolerance = {
+      L: computeAxisTolerance(meanProfile.L, stdProfile.L, count),
+      S: computeAxisTolerance(meanProfile.S, stdProfile.S, count),
+      A: computeAxisTolerance(meanProfile.A, stdProfile.A, count),
+      R: computeAxisTolerance(meanProfile.R, stdProfile.R, count),
+    };
 
     return res.json({
-      mean: { L: mean(Ls), S: mean(Ss), A: mean(As), R: mean(Rs) },
-      std: { L: std(Ls), S: std(Ss), A: std(As), R: std(Rs) },
+      mean: meanProfile,
+      std: stdProfile,
+      axisTolerance,
+      targetBand: {
+        min: {
+          L: clamp01(meanProfile.L - axisTolerance.L),
+          S: clamp01(meanProfile.S - axisTolerance.S),
+          A: clamp01(meanProfile.A - axisTolerance.A),
+          R: clamp01(meanProfile.R - axisTolerance.R),
+        },
+        max: {
+          L: clamp01(meanProfile.L + axisTolerance.L),
+          S: clamp01(meanProfile.S + axisTolerance.S),
+          A: clamp01(meanProfile.A + axisTolerance.A),
+          R: clamp01(meanProfile.R + axisTolerance.R),
+        },
+      },
       count,
       stability,
       effectiveTolerance,

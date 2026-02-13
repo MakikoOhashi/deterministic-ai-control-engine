@@ -16,6 +16,11 @@ type Components = {
   A: number;
   R: number;
 };
+type TargetBand = {
+  min: Components;
+  max: Components;
+};
+type AxisTolerance = Components;
 
 type OverallResponse = {
   D: number;
@@ -112,6 +117,8 @@ export default function Home() {
 
   const [weights, setWeights] = useState<Weights | null>(null);
   const [target, setTarget] = useState<Components | null>(null);
+  const [targetBand, setTargetBand] = useState<TargetBand | null>(null);
+  const [axisTolerance, setAxisTolerance] = useState<AxisTolerance | null>(null);
   const [targetStability, setTargetStability] = useState<string | null>(null);
   const [effectiveTolerance, setEffectiveTolerance] = useState<number>(0.05);
   const [result, setResult] = useState<OverallResponse | null>(null);
@@ -123,10 +130,17 @@ export default function Home() {
   const [ocrLang, setOcrLang] = useState<"eng" | "jpn+eng">("eng");
   const [ocrLoading, setOcrLoading] = useState(false);
   const [structuring, setStructuring] = useState(false);
+  const [sourceAnswerKey, setSourceAnswerKey] = useState<string[]>([]);
   const [similarity, setSimilarity] = useState<number | null>(null);
   const [similarityBreakdown, setSimilarityBreakdown] = useState<SimilarityBreakdown | null>(null);
   const [choiceIntent, setChoiceIntent] = useState<ChoiceIntent | null>(null);
   const [choiceStructure, setChoiceStructure] = useState<ChoiceStructure | null>(null);
+  const [runMeta, setRunMeta] = useState<{
+    runId?: string;
+    sourceId?: string;
+    candidateId?: string;
+    stage?: string;
+  } | null>(null);
   const parsedBlank = useMemo(
     () => (taskType === "context_completion" ? parsePrimaryBlank(question) : null),
     [taskType, question]
@@ -245,14 +259,29 @@ export default function Home() {
         throw new Error(err.error || "Structuring failed.");
       }
       const data = (await res.json()) as {
-        taskType: TaskType;
+        taskType?: TaskType;
         normalizedText?: string;
         displayText?: string;
+        answerKey?: string[];
+        payload?: {
+          taskType?: TaskType;
+          displayText?: string;
+          sourceAnswerKey?: string[];
+        };
       };
-      if (data.taskType && data.taskType !== taskType) {
-        setTaskType(data.taskType);
+      const payload = data.payload;
+      const nextTaskType = payload?.taskType || data.taskType;
+      if (nextTaskType && nextTaskType !== taskType) {
+        setTaskType(nextTaskType);
       }
-      const normalized = (data.displayText || data.normalizedText || input).trim();
+      const normalized = (payload?.displayText || data.displayText || data.normalizedText || input).trim();
+      setSourceAnswerKey(
+        Array.isArray(payload?.sourceAnswerKey)
+          ? payload.sourceAnswerKey
+          : Array.isArray(data.answerKey)
+          ? data.answerKey
+          : []
+      );
       if (taskType === "context_completion" && !/[_*]{2,}/.test(normalized)) {
         throw new Error("Could not detect blanks from input. Please use a clearer image or add underscores manually.");
       }
@@ -292,8 +321,12 @@ export default function Home() {
         mean: Components;
         stability: string;
         effectiveTolerance: number;
+        axisTolerance?: AxisTolerance;
+        targetBand?: TargetBand;
       };
       setTarget(data.mean);
+      setTargetBand(data.targetBand ?? null);
+      setAxisTolerance(data.axisTolerance ?? null);
       setTargetStability(data.stability);
       setEffectiveTolerance(data.effectiveTolerance);
       return data.mean;
@@ -305,6 +338,8 @@ export default function Home() {
       setChoices([]);
       setCorrectIndex(null);
       setCorrectText("");
+      setTargetBand(null);
+      setAxisTolerance(null);
       setSelected(null);
       setTypedAnswer("");
       return null;
@@ -324,6 +359,10 @@ export default function Home() {
     setContextSlots([]);
     setContextAnswers([]);
     setContextAnswerKey([]);
+    setTargetBand(null);
+    setAxisTolerance(null);
+    setSourceAnswerKey([]);
+    setRunMeta(null);
     setSubmitted(false);
   }, [taskType]);
 
@@ -349,6 +388,7 @@ export default function Home() {
         body: JSON.stringify({
           sourceText,
           target: targetOverride ?? target,
+          sourceAnswers: taskType === "context_completion" ? sourceAnswerKey : undefined,
         }),
       });
       if (!res.ok) {
@@ -367,6 +407,10 @@ export default function Home() {
         similarityBreakdown?: SimilarityBreakdown;
         choiceIntent?: ChoiceIntent;
         choiceStructure?: ChoiceStructure;
+        runId?: string;
+        sourceId?: string;
+        candidateId?: string;
+        debug?: { stage?: string };
       };
       if (taskType === "guided_reading") {
         const item = data.item as {
@@ -399,11 +443,14 @@ export default function Home() {
       setSimilarityBreakdown(data.similarityBreakdown ?? null);
       setChoiceIntent(data.choiceIntent ?? null);
       setChoiceStructure(data.choiceStructure ?? null);
+      setRunMeta({
+        runId: data.runId,
+        sourceId: data.sourceId,
+        candidateId: data.candidateId,
+        stage: data.debug?.stage,
+      });
       setSelected(null);
       setTypedAnswer("");
-      setContextSlots([]);
-      setContextAnswers([]);
-      setContextAnswerKey([]);
       setSubmitted(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -413,6 +460,7 @@ export default function Home() {
       setSimilarityBreakdown(null);
       setChoiceIntent(null);
       setChoiceStructure(null);
+      setRunMeta(null);
     } finally {
       setLoading(false);
     }
@@ -620,10 +668,23 @@ export default function Home() {
                                 {ch}
                               </span>
                             ))}
-                          {Array.from({ length: parsedBlank.missingCount }).map((_, idx) => (
-                            <span key={`m-${idx}`} className="blank-cell">
-                              {typedAnswer[idx] || ""}
-                            </span>
+                          {Array.from({ length: parsedBlank!.missingCount }).map((_, idx) => (
+                            <input
+                              key={`m-${idx}`}
+                              className="blank-cell blank-input"
+                              value={typedAnswer[idx] || ""}
+                              onChange={(e) => {
+                                const char = (e.target.value || "").slice(-1);
+                                setTypedAnswer((prev) => {
+                                  const arr = Array.from({ length: parsedBlank!.missingCount }).map(
+                                    (_x, i) => prev[i] || ""
+                                  );
+                                  arr[idx] = char;
+                                  return arr.join("");
+                                });
+                              }}
+                              maxLength={1}
+                            />
                           ))}
                         </span>
                         {question.slice(parsedBlank.end)}
@@ -655,24 +716,13 @@ export default function Home() {
                         </div>
                       ))}
                     </div>
-                  ) : (
+                  ) : parsedBlank ? null : (
                     <div className="field">
-                      <label>
-                        {parsedBlank?.prefix ? "Type missing letters" : "Your answer"}
-                      </label>
+                      <label>Your answer</label>
                       <input
                         value={typedAnswer}
-                        onChange={(e) => {
-                          const next = e.target.value;
-                          if (parsedBlank) {
-                            setTypedAnswer(next.slice(0, parsedBlank.missingCount));
-                          } else {
-                            setTypedAnswer(next);
-                          }
-                        }}
-                        placeholder={
-                          parsedBlank ? `${parsedBlank.missingCount} letters` : "Type the missing word(s)"
-                        }
+                        onChange={(e) => setTypedAnswer(e.target.value)}
+                        placeholder="Type the missing word(s)"
                       />
                     </div>
                   )}
@@ -713,6 +763,8 @@ export default function Home() {
       <QualityConsole
         result={result}
         target={target}
+        targetBand={targetBand}
+        axisTolerance={axisTolerance}
         weights={weights}
         effectiveTolerance={effectiveTolerance}
         stability={targetStability}
@@ -720,6 +772,7 @@ export default function Home() {
         similarityBreakdown={similarityBreakdown}
         choiceIntent={choiceIntent}
         choiceStructure={choiceStructure}
+        runMeta={runMeta}
         error={error}
       />
     </main>

@@ -7,6 +7,11 @@ import { generateFillBlankCandidates } from "./fill-blank.service.js";
 export interface ProfileStats {
   mean: { L: number; S: number; A: number; R: number };
   std: { L: number; S: number; A: number; R: number };
+  axisTolerance: { L: number; S: number; A: number; R: number };
+  targetBand: {
+    min: { L: number; S: number; A: number; R: number };
+    max: { L: number; S: number; A: number; R: number };
+  };
   count: number;
   stability: "Low" | "Medium" | "High";
   effectiveTolerance: number;
@@ -30,9 +35,20 @@ function stabilityFromCount(count: number) {
 }
 
 function toleranceFromCount(count: number) {
-  if (count <= 1) return 0.1;
+  if (count <= 1) return 0.12;
   if (count === 2) return 0.07;
   return 0.05;
+}
+
+function axisTolerance(meanVal: number, stdVal: number, count: number) {
+  const base = count <= 1 ? 0.12 : count === 2 ? 0.08 : 0.05;
+  const adaptive = stdVal > 0 ? stdVal * 1.5 : base;
+  const tol = Math.max(base, adaptive);
+  return Math.min(Math.max(tol, 0.03), 0.25);
+}
+
+function clamp01(v: number) {
+  return Math.max(0, Math.min(1, v));
 }
 
 export async function computeTargetFromSources(
@@ -72,9 +88,32 @@ export async function computeTargetFromSources(
   }
 
   const count = items.length;
+  const meanProfile = { L: mean(Ls), S: mean(Ss), A: mean(As), R: mean(Rs) };
+  const stdProfile = { L: std(Ls), S: std(Ss), A: std(As), R: std(Rs) };
+  const axisTol = {
+    L: axisTolerance(meanProfile.L, stdProfile.L, count),
+    S: axisTolerance(meanProfile.S, stdProfile.S, count),
+    A: axisTolerance(meanProfile.A, stdProfile.A, count),
+    R: axisTolerance(meanProfile.R, stdProfile.R, count),
+  };
   return {
-    mean: { L: mean(Ls), S: mean(Ss), A: mean(As), R: mean(Rs) },
-    std: { L: std(Ls), S: std(Ss), A: std(As), R: std(Rs) },
+    mean: meanProfile,
+    std: stdProfile,
+    axisTolerance: axisTol,
+    targetBand: {
+      min: {
+        L: clamp01(meanProfile.L - axisTol.L),
+        S: clamp01(meanProfile.S - axisTol.S),
+        A: clamp01(meanProfile.A - axisTol.A),
+        R: clamp01(meanProfile.R - axisTol.R),
+      },
+      max: {
+        L: clamp01(meanProfile.L + axisTol.L),
+        S: clamp01(meanProfile.S + axisTol.S),
+        A: clamp01(meanProfile.A + axisTol.A),
+        R: clamp01(meanProfile.R + axisTol.R),
+      },
+    },
     count,
     stability: stabilityFromCount(count),
     effectiveTolerance: toleranceFromCount(count),

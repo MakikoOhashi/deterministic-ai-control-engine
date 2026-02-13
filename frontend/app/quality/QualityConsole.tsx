@@ -62,6 +62,8 @@ function distanceCompliance(distanceValue: number, tol: number) {
 export default function QualityConsole(props: {
   result: OverallResponse | null;
   target: Components | null;
+  targetBand?: { min: Components; max: Components } | null;
+  axisTolerance?: Components | null;
   weights: Weights | null;
   effectiveTolerance: number;
   stability: string | null;
@@ -80,11 +82,19 @@ export default function QualityConsole(props: {
     distractorVariance: number;
     isolationIndex: number;
   } | null;
+  runMeta?: {
+    runId?: string;
+    sourceId?: string;
+    candidateId?: string;
+    stage?: string;
+  } | null;
   error?: string | null;
 }) {
   const {
     result,
     target,
+    targetBand,
+    axisTolerance,
     weights,
     effectiveTolerance,
     stability,
@@ -92,6 +102,7 @@ export default function QualityConsole(props: {
     similarityBreakdown,
     choiceIntent,
     choiceStructure,
+    runMeta,
     error,
   } = props;
 
@@ -149,6 +160,41 @@ export default function QualityConsole(props: {
             </div>
           </div>
         </div>
+        {runMeta?.stage || runMeta?.runId ? (
+          <div className="summary-card" style={{ marginTop: 8 }}>
+            <div className="label">Status Trace</div>
+            <div className="meta">
+              Stage: {runMeta.stage || "--"} {runMeta.runId ? `| Run: ${runMeta.runId}` : ""}{" "}
+              {runMeta.sourceId ? `| Source: ${runMeta.sourceId}` : ""}
+            </div>
+          </div>
+        ) : null}
+
+        {targetBand ? (
+          <div className="table compact" style={{ marginTop: 12 }}>
+            <div className="row header">
+              <div>Target Range</div>
+              <div>Min</div>
+              <div>Max</div>
+              <div></div>
+              <div></div>
+            </div>
+            {[
+              { key: "L", min: targetBand.min.L, max: targetBand.max.L },
+              { key: "S", min: targetBand.min.S, max: targetBand.max.S },
+              { key: "A", min: targetBand.min.A, max: targetBand.max.A },
+              { key: "R", min: targetBand.min.R, max: targetBand.max.R },
+            ].map((row) => (
+              <div className="row" key={`band-${row.key}`}>
+                <div className="axis">{row.key}</div>
+                <div>{row.min.toFixed(3)}</div>
+                <div>{row.max.toFixed(3)}</div>
+                <div></div>
+                <div></div>
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         {similarityBreakdown ? (
           <div className="table compact">
@@ -233,7 +279,19 @@ export default function QualityConsole(props: {
             return (
               <div className="row" key={row.key}>
                 <div className="axis">{row.key}</div>
-                <div>{result && target ? row.target.toFixed(3) : "--"}</div>
+                <div>
+                  {result && target
+                    ? targetBand
+                      ? `${targetBand.min[row.key as keyof Components].toFixed(3)}–${targetBand.max[
+                          row.key as keyof Components
+                        ].toFixed(3)}`
+                      : axisTolerance
+                      ? `${(row.target - axisTolerance[row.key as keyof Components]).toFixed(
+                          3
+                        )}–${(row.target + axisTolerance[row.key as keyof Components]).toFixed(3)}`
+                      : row.target.toFixed(3)
+                    : "--"}
+                </div>
                 <div>{result ? row.current.toFixed(3) : "--"}</div>
                 <div>{result && target ? formatDelta(row.delta) : "--"}</div>
                 <div>
