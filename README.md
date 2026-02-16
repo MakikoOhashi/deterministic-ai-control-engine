@@ -11,6 +11,21 @@
 
 ---
 
+## Local Dev（1コマンド起動）
+
+```bash
+npm install
+npm run dev
+```
+
+- backend: `tsx watch` で自動リロード
+- frontend: `next dev` で自動リロード
+- ポート固定（デフォルト）:
+  - frontend: `3000`
+  - backend: `3001`（`PORT` で変更可）
+
+---
+
 ## 現在の対応タスク
 - `Context Completion`（空欄補充）
 - `Guided Reading`（短文読解 + 選択肢）

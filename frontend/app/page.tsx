@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import QualityConsole from "./quality/QualityConsole";
 
 type Weights = {
@@ -92,6 +92,12 @@ function parsePrimaryBlank(text: string): ParsedBlank {
   return null;
 }
 
+function countBlanksInText(text: string): number {
+  const normalized = String(text || "");
+  const matches = normalized.match(/([A-Za-z]{0,6}\s*(?:[_*]\s*){2,}|(?:[_*]\s*){2,})/g);
+  return matches ? matches.length : 0;
+}
+
 export default function Home() {
   const apiBase = useMemo(
     () => process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001",
@@ -131,6 +137,8 @@ export default function Home() {
   const [ocrLoading, setOcrLoading] = useState(false);
   const [structuring, setStructuring] = useState(false);
   const [sourceAnswerKey, setSourceAnswerKey] = useState<string[]>([]);
+  const [sourceSlotCount, setSourceSlotCount] = useState<number>(1);
+  const [sourcePrefixMode, setSourcePrefixMode] = useState<"none" | "hasPrefix">("none");
   const [similarity, setSimilarity] = useState<number | null>(null);
   const [similarityBreakdown, setSimilarityBreakdown] = useState<SimilarityBreakdown | null>(null);
   const [choiceIntent, setChoiceIntent] = useState<ChoiceIntent | null>(null);
@@ -144,6 +152,10 @@ export default function Home() {
   const parsedBlank = useMemo(
     () => (taskType === "context_completion" ? parsePrimaryBlank(question) : null),
     [taskType, question]
+  );
+  const sortedContextSlots = useMemo(
+    () => [...contextSlots].sort((a, b) => a.start - b.start),
+    [contextSlots]
   );
 
   useEffect(() => {
@@ -267,6 +279,8 @@ export default function Home() {
           taskType?: TaskType;
           displayText?: string;
           sourceAnswerKey?: string[];
+          slotCount?: number;
+          extraction?: { prefixMode?: "none" | "hasPrefix" };
         };
       };
       const payload = data.payload;
@@ -282,6 +296,16 @@ export default function Home() {
           ? data.answerKey
           : []
       );
+      const fromPayload = Number(payload?.slotCount || 0);
+      const fromText = countBlanksInText(normalized);
+      const fromAnswerKey = Array.isArray(payload?.sourceAnswerKey)
+        ? payload.sourceAnswerKey.length
+        : Array.isArray(data.answerKey)
+        ? data.answerKey.length
+        : 0;
+      const inferredSlotCount = Math.max(fromPayload, fromText, fromAnswerKey, 1);
+      setSourceSlotCount(Math.max(1, Math.min(2, inferredSlotCount)));
+      setSourcePrefixMode(payload?.extraction?.prefixMode === "hasPrefix" ? "hasPrefix" : "none");
       if (taskType === "context_completion" && !/[_*]{2,}/.test(normalized)) {
         throw new Error("Could not detect blanks from input. Please use a clearer image or add underscores manually.");
       }
@@ -362,6 +386,8 @@ export default function Home() {
     setTargetBand(null);
     setAxisTolerance(null);
     setSourceAnswerKey([]);
+    setSourceSlotCount(1);
+    setSourcePrefixMode("none");
     setRunMeta(null);
     setSubmitted(false);
   }, [taskType]);
@@ -389,6 +415,12 @@ export default function Home() {
           sourceText,
           target: targetOverride ?? target,
           sourceAnswers: taskType === "context_completion" ? sourceAnswerKey : undefined,
+          expectedBlankCount:
+            taskType === "context_completion"
+              ? Math.max(1, Math.min(2, sourceSlotCount))
+              : undefined,
+          prefixMode:
+            taskType === "context_completion" ? sourcePrefixMode : undefined,
         }),
       });
       if (!res.ok) {
@@ -524,14 +556,14 @@ export default function Home() {
       ? `${parsedBlank.prefix}${typedAnswer}`
       : typedAnswer;
   const contextSubmittedList =
-    contextSlots.length > 1
-      ? contextAnswers.map((a, idx) => `${contextSlots[idx]?.prefix ?? ""}${a}`)
+    sortedContextSlots.length > 0
+      ? sortedContextSlots.map((slot, idx) => `${slot.prefix ?? ""}${contextAnswers[idx] || ""}`)
       : [contextSubmittedAnswer];
   const isCorrect =
     submitted &&
     (taskType === "guided_reading"
       ? selected === correctChoice
-      : contextSlots.length > 1
+      : sortedContextSlots.length > 0
       ? contextSubmittedList.every(
           (v, i) => v.trim().toLowerCase() === (contextAnswerKey[i] || "").trim().toLowerCase()
         )
@@ -654,8 +686,55 @@ export default function Home() {
                 <div className="context-completion">
                   <div className="context-heading">Complete the text with the correct word</div>
                   <div className="context-text">
-                    {contextSlots.length > 1 ? (
-                      question || "—"
+                    {sortedContextSlots.length > 0 ? (
+                      <>
+                        {(() => {
+                          const nodes: ReactNode[] = [];
+                          let cursor = 0;
+                          sortedContextSlots.forEach((slot, slotIdx) => {
+                            const start = Math.max(0, Math.min(slot.start, question.length));
+                            const end = Math.max(start, Math.min(slot.end, question.length));
+                            nodes.push(question.slice(cursor, start));
+                            nodes.push(
+                              <span key={`slot-inline-${slotIdx}`} className="context-blank">
+                                {slot.prefix
+                                  .split("")
+                                  .filter(Boolean)
+                                  .map((ch, idx) => (
+                                    <span key={`p-${slotIdx}-${idx}`} className="blank-cell fixed">
+                                      {ch}
+                                    </span>
+                                  ))}
+                                {Array.from({ length: slot.missingCount }).map((_, idx) => (
+                                  <input
+                                    key={`m-${slotIdx}-${idx}`}
+                                    className="blank-cell blank-input"
+                                    value={contextAnswers[slotIdx]?.[idx] || ""}
+                                    onChange={(e) => {
+                                      const char = (e.target.value || "").slice(-1);
+                                      setContextAnswers((prev) => {
+                                        const cloned = [...prev];
+                                        const current = (cloned[slotIdx] || "").padEnd(
+                                          slot.missingCount,
+                                          " "
+                                        );
+                                        const arr = current.split("");
+                                        arr[idx] = char || " ";
+                                        cloned[slotIdx] = arr.join("").trimEnd();
+                                        return cloned;
+                                      });
+                                    }}
+                                    maxLength={1}
+                                  />
+                                ))}
+                              </span>
+                            );
+                            cursor = end;
+                          });
+                          nodes.push(question.slice(cursor));
+                          return nodes;
+                        })()}
+                      </>
                     ) : parsedBlank ? (
                       <>
                         {question.slice(0, parsedBlank.start)}
@@ -693,30 +772,7 @@ export default function Home() {
                       question || "—"
                     )}
                   </div>
-                  {contextSlots.length > 1 ? (
-                    <div className="field">
-                      <label>Type missing letters for each blank</label>
-                      {contextSlots.map((slot, idx) => (
-                        <div key={`slot-${idx}`} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-                          <span className="muted" style={{ minWidth: 80 }}>
-                            Blank {idx + 1}: {slot.prefix}
-                          </span>
-                          <input
-                            value={contextAnswers[idx] || ""}
-                            onChange={(e) => {
-                              const next = e.target.value.slice(0, slot.missingCount);
-                              setContextAnswers((prev) => {
-                                const cloned = [...prev];
-                                cloned[idx] = next;
-                                return cloned;
-                              });
-                            }}
-                            placeholder={`${slot.missingCount} letters`}
-                          />
-                        </div>
-                      ))}
-                    </div>
-                  ) : parsedBlank ? null : (
+                  {sortedContextSlots.length > 0 || parsedBlank ? null : (
                     <div className="field">
                       <label>Your answer</label>
                       <input
@@ -734,8 +790,10 @@ export default function Home() {
                   disabled={
                     taskType === "guided_reading"
                       ? !selected
-                      : contextSlots.length > 1
-                      ? contextAnswers.some((a, idx) => (a || "").trim().length < (contextSlots[idx]?.missingCount || 0))
+                      : sortedContextSlots.length > 0
+                      ? sortedContextSlots.some(
+                          (slot, idx) => (contextAnswers[idx] || "").trim().length < slot.missingCount
+                        )
                       : !typedAnswer.trim()
                   }
                 >
@@ -749,7 +807,7 @@ export default function Home() {
                 <div className={isCorrect ? "result good" : "result bad"}>
                   {isCorrect
                     ? "Correct"
-                    : contextSlots.length > 1
+                    : sortedContextSlots.length > 0
                     ? `Correct answers: ${contextAnswerKey.join(", ")}`
                     : `Correct answer: ${correctChoice}`}
                 </div>

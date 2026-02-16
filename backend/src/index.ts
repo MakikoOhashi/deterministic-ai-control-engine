@@ -671,38 +671,82 @@ function harmonizeSingleBlankWithAnswer(
   return text.replace(/(?:_\s*){2,}/, token);
 }
 
+function harmonizePrefixBlankWithoutSourcePrefix(text: string, answer: string): string {
+  const clean = answer.replace(/\s+/g, "").toLowerCase().replace(/[^a-z]/g, "");
+  if (!clean) return text;
+  const n = clean.length;
+  if (n < 3) return text.replace(/([A-Za-z]{1,5}\s*(?:_\s*){2,}|(?:_\s*){2,})/, "__");
+  const maxPrefix = Math.min(4, n - 2);
+  const hash = Array.from(clean).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+  const prefixLen = Math.max(1, Math.min(maxPrefix, 1 + (hash % maxPrefix)));
+  const prefix = clean.slice(0, prefixLen);
+  const missing = Math.max(n - prefixLen, 2);
+  const token = `${prefix}${"_".repeat(missing)}`;
+  return text.replace(/([A-Za-z]{1,5}\s*(?:_\s*){2,}|(?:_\s*){2,})/, token);
+}
+
 function buildBlankedCandidateFromFullText(
   fullText: string,
-  slotRules: Array<{ prefix: string; missingCount: number }>,
+  slotRules: Array<{ missingCount: number }>,
   expectedBlankCount: number,
-  chosenWords?: string[]
+  chosenWords?: string[],
+  chosenPrefixLengths?: number[],
+  forcePrefixMode = false
 ): { text: string; answerKey: string[] } | null {
   const words = getWordMatches(fullText);
   if (words.length === 0) return null;
 
   const used = new Set<number>();
-  const picked: Array<{ index: number; word: string; start: number; end: number; rule: { prefix: string; missingCount: number } }> = [];
+  const picked: Array<{
+    index: number;
+    word: string;
+    start: number;
+    end: number;
+    rule: { missingCount: number };
+  }> = [];
+
+  const choosePrefixLength = (
+    word: string,
+    targetMissingCount: number,
+    requestedPrefixLength?: number
+  ) => {
+    const n = word.length;
+    const maxPrefix = Math.min(4, n - 2);
+    if (maxPrefix < 1) return 0;
+    if (
+      Number.isFinite(requestedPrefixLength) &&
+      requestedPrefixLength != null &&
+      requestedPrefixLength >= 1
+    ) {
+      return Math.max(1, Math.min(requestedPrefixLength, maxPrefix));
+    }
+    const clampedMissing = Math.max(2, Math.min(targetMissingCount || Math.floor(n / 2), n - 1));
+    let prefixLen = n - clampedMissing;
+    if (prefixLen < 1 || prefixLen > maxPrefix) {
+      const hash = Array.from(word).reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
+      prefixLen = 1 + (hash % maxPrefix);
+    }
+    return Math.max(1, Math.min(prefixLen, maxPrefix));
+  };
 
   const chooseWordForSlot = (slotIdx: number) => {
-    const rule = slotRules[slotIdx] || { prefix: "", missingCount: 2 };
+    const rule = slotRules[slotIdx] || { missingCount: 2 };
     const requested = String(chosenWords?.[slotIdx] || "").trim().toLowerCase();
     let selectedIndex = -1;
 
     if (requested) {
       selectedIndex = words.findIndex(
-        (w, idx) =>
-          !used.has(idx) &&
-          w.word.toLowerCase() === requested &&
-          (!rule.prefix || w.word.toLowerCase().startsWith(rule.prefix.toLowerCase()))
+        (w, idx) => !used.has(idx) && w.word.toLowerCase() === requested
       );
     }
 
-    if (selectedIndex < 0 && rule.prefix) {
+    if (selectedIndex < 0 && rule.missingCount > 0) {
+      const targetLen = Math.max(rule.missingCount + 1, 4);
       selectedIndex = words.findIndex(
         (w, idx) =>
           !used.has(idx) &&
-          w.word.length >= Math.max(rule.prefix.length + 1, 4) &&
-          w.word.toLowerCase().startsWith(rule.prefix.toLowerCase())
+          w.word.length >= 4 &&
+          Math.abs(w.word.length - targetLen) <= 2
       );
     }
 
@@ -732,11 +776,13 @@ function buildBlankedCandidateFromFullText(
   const sorted = [...picked].sort((a, b) => b.start - a.start);
   for (const p of sorted) {
     const slotIdx = picked.findIndex((x) => x.start === p.start && x.end === p.end);
-    const prefix = p.rule.prefix || "";
     const lowerWord = p.word.toLowerCase();
     let replacement = "";
-    if (prefix && lowerWord.startsWith(prefix.toLowerCase())) {
-      const missing = Math.max(lowerWord.length - prefix.length, 1);
+    if (forcePrefixMode) {
+      const requestedPrefix = chosenPrefixLengths?.[slotIdx];
+      const prefixLen = choosePrefixLength(lowerWord, p.rule.missingCount, requestedPrefix);
+      const prefix = lowerWord.slice(0, prefixLen);
+      const missing = Math.max(lowerWord.length - prefixLen, 2);
       replacement = `${prefix}${"_".repeat(missing)}`;
     } else {
       replacement = "_".repeat(Math.max(lowerWord.length, 2));
@@ -747,6 +793,38 @@ function buildBlankedCandidateFromFullText(
 
   if (answerKey.some((a) => !a)) return null;
   return { text: out, answerKey };
+}
+
+function validateBlankedCandidateShape(
+  text: string,
+  answerKey: string[],
+  expectedBlankCount: number,
+  sourceWordCount: number,
+  prefixMode: boolean
+): { ok: boolean; reason?: string } {
+  const slots = extractBlankSlots(text);
+  if (slots.length !== expectedBlankCount) {
+    return { ok: false, reason: `Expected exactly ${expectedBlankCount} blank${expectedBlankCount > 1 ? "s" : ""}.` };
+  }
+  const generatedWordCount = countWords(text);
+  if (Math.abs(generatedWordCount - sourceWordCount) > 15) {
+    return { ok: false, reason: "Length mismatch from source range." };
+  }
+  for (let i = 0; i < expectedBlankCount; i += 1) {
+    const slot = slots[i];
+    const ans = String(answerKey[i] || "").replace(/\s+/g, "").toLowerCase();
+    if (!slot || !ans) return { ok: false, reason: `Missing answer at index ${i}.` };
+    if (prefixMode) {
+      if (!slot.prefix) return { ok: false, reason: "Expected prefix hint before blank." };
+      const expectedMissing = ans.length - slot.prefix.length;
+      if (expectedMissing < 1 || slot.missingCount !== expectedMissing) {
+        return { ok: false, reason: "Answer length does not match blank length." };
+      }
+    } else if (slot.missingCount !== ans.length) {
+      return { ok: false, reason: "Answer length does not match blank length." };
+    }
+  }
+  return { ok: true };
 }
 
 app.post("/ocr/structure", async (req, res) => {
@@ -993,11 +1071,13 @@ app.post("/ocr/structure", async (req, res) => {
 
 app.post("/generate/fill-blank", async (req, res) => {
   try {
-    const { sourceText, target, mode, sourceAnswers } = req.body as {
+    const { sourceText, target, mode, sourceAnswers, expectedBlankCount: expectedBlankCountHint, prefixMode } = req.body as {
       sourceText: string;
       target?: { L: number; S: number; A: number; R: number };
       mode?: "A" | "B";
       sourceAnswers?: string[];
+      expectedBlankCount?: number;
+      prefixMode?: "none" | "hasPrefix";
     };
     if (typeof sourceText !== "string") {
       return res.status(400).json({ error: "Expected { sourceText: string }" });
@@ -1035,7 +1115,15 @@ app.post("/generate/fill-blank", async (req, res) => {
       (s) => s.prefix.length <= 4 && s.missingCount >= 1 && s.missingCount <= 8
     );
     // v1 cloze: keep generation flexible by limiting slot control to 1-2 blanks.
-    const expectedBlankCount = Math.max(1, Math.min(extractedSlots.length || 1, 2));
+    const expectedBlankCount = Math.max(
+      1,
+      Math.min(
+        Number.isFinite(expectedBlankCountHint as number)
+          ? Number(expectedBlankCountHint)
+          : extractedSlots.length || 1,
+        2
+      )
+    );
     let candidates = generateFillBlankCandidates(cleanedSourceText);
     if (candidates.length === 0 && !generationProvider) {
       return res.status(422).json({
@@ -1060,12 +1148,18 @@ app.post("/generate/fill-blank", async (req, res) => {
         }
       }
     }
-    const slotRules = (sourceSlots.length > 0 ? sourceSlots : extractedSlots)
+    const slotPatternSource = sourceSlots.length > 0 ? sourceSlots : extractedSlots;
+    const slotRules = slotPatternSource
       .slice(0, expectedBlankCount)
       .map((s) => ({
-        prefix: s.prefix || "",
         missingCount: s.missingCount,
       }));
+    const sourcePrefixMode =
+      prefixMode === "hasPrefix"
+        ? true
+        : prefixMode === "none"
+        ? false
+        : slotPatternSource.some((s) => (s.prefix || "").length > 0);
     const sourceWordCount = countWords(cleanedSourceText);
     const sourceBucket = textLengthBucket(cleanedSourceText);
     const sourceCefr = estimateCefrLevel(cleanedSourceText);
@@ -1074,7 +1168,7 @@ app.post("/generate/fill-blank", async (req, res) => {
     const slotConstraintSummary =
       slotRules.length > 0
         ? slotRules
-            .map((s) => `${s.prefix || "(none)"}:${s.missingCount}`)
+            .map((s) => `len:${s.missingCount}`)
             .join(", ")
         : "single_blank";
 
@@ -1086,9 +1180,14 @@ app.post("/generate/fill-blank", async (req, res) => {
         "Create one NEW paragraph/sentence for a context-completion item.",
         "Do not include blanks, underscores, choices, or answers.",
         "Use a different theme than the source text.",
+        `Keep length around ${sourceWordCount} words (allowed range: ${Math.max(
+          8,
+          sourceWordCount - 10
+        )} to ${sourceWordCount + 10}).`,
         `Target length bucket: ${sourceBucket} (source word count: ${sourceWordCount}).`,
         `Target CEFR: ${sourceCefr}.`,
         `Target lexical/structural style: L≈${sourceLex.toFixed(2)}, S≈${sourceStruct.toFixed(2)}.`,
+        "Output grammatically natural English only. No merged words, no typos.",
         expectedBlankCount > 1
           ? `Write enough content to support ${expectedBlankCount} blanks naturally.`
           : "Write enough content to support one meaningful blank.",
@@ -1109,21 +1208,41 @@ app.post("/generate/fill-blank", async (req, res) => {
           "Choose words from the text that should be blanked.",
           `Need exactly ${expectedBlankCount} word(s).`,
           slotRules.length > 0
-            ? `Slot constraints by index (prefix:missing): ${slotConstraintSummary}.`
+            ? `Slot constraints by index (missing length reference): ${slotConstraintSummary}.`
             : "No explicit slot constraints.",
+          sourcePrefixMode
+            ? "Output format uses prefix+underscores, but do NOT copy source prefix."
+            : "Output format uses full underscores.",
+          normalizedSourceAnswers.size > 0
+            ? `Do NOT choose any of these source answers: ${Array.from(normalizedSourceAnswers).join(
+                ", "
+              )}.`
+            : "Avoid reusing obvious source answer words.",
           "Each chosen word must appear exactly in the text.",
-          "Return JSON: {\"words\":[\"w1\",\"w2\"]}.",
+          sourcePrefixMode
+            ? "Return JSON: {\"words\":[\"w1\",\"w2\"],\"prefixLengths\":[2,2]} where prefixLengths are 1-3."
+            : "Return JSON: {\"words\":[\"w1\",\"w2\"]}.",
           `Text:\n${fullText}`,
         ].join("\n");
 
         const pickRaw = await generationProvider.generateText(pickPrompt, pickSystem);
-        const pickParsed = extractJson(pickRaw) as { words?: unknown[]; chosenWord?: unknown } | null;
+        const pickParsed = extractJson(pickRaw) as {
+          words?: unknown[];
+          chosenWord?: unknown;
+          prefixLengths?: unknown[];
+        } | null;
         const chosenWords =
           Array.isArray(pickParsed?.words)
             ? pickParsed!.words.map((w) => String(w || "").trim()).filter(Boolean)
             : pickParsed?.chosenWord
             ? [String(pickParsed.chosenWord).trim()]
             : [];
+        const chosenPrefixLengths = Array.isArray(pickParsed?.prefixLengths)
+          ? pickParsed.prefixLengths
+              .map((x) => Number(x))
+              .filter((n) => Number.isFinite(n))
+              .map((n) => Math.max(1, Math.min(3, n)))
+          : undefined;
         if (chosenWords.length > 0) {
           stage = "stepB_words_selected";
         }
@@ -1132,16 +1251,31 @@ app.post("/generate/fill-blank", async (req, res) => {
           fullText,
           slotRules,
           expectedBlankCount,
-          chosenWords
+          chosenWords,
+          chosenPrefixLengths,
+          sourcePrefixMode
         );
         if (!blanked) continue;
+        const shape = validateBlankedCandidateShape(
+          blanked.text,
+          blanked.answerKey,
+          expectedBlankCount,
+          sourceWordCount,
+          sourcePrefixMode
+        );
+        if (!shape.ok) continue;
         stage = "stepC_blank_built";
         const firstAnswer = blanked.answerKey[0];
         if (!firstAnswer) continue;
-        if (normalizedSourceAnswers.has(normalizeAnswerToken(firstAnswer))) continue;
+        if (
+          blanked.answerKey.some((a) => normalizedSourceAnswers.has(normalizeAnswerToken(a)))
+        ) {
+          continue;
+        }
         const generatedCandidate = {
           text: blanked.text,
           correct: firstAnswer,
+          answerKey: blanked.answerKey,
           distractors: buildDistractorsFromText(fullText, firstAnswer),
           steps: sourceWordCount >= 12 ? 2 : 1,
         };
@@ -1184,8 +1318,8 @@ app.post("/generate/fill-blank", async (req, res) => {
       return res.json({
         item: chosen,
         displayText: chosen.text,
-        answerKey: [chosen.correct],
-        answers: [chosen.correct],
+        answerKey: (chosen as { answerKey?: string[] }).answerKey || [chosen.correct],
+        answers: (chosen as { answerKey?: string[] }).answerKey || [chosen.correct],
         slots,
         candidates,
         format,
@@ -1262,7 +1396,8 @@ app.post("/generate/fill-blank", async (req, res) => {
         stage = "accepted";
         return res.json({
           item: best.item,
-          answers: [best.item.correct],
+          answerKey: (best.item as { answerKey?: string[] }).answerKey || [best.item.correct],
+          answers: (best.item as { answerKey?: string[] }).answerKey || [best.item.correct],
           slots,
           candidates: scored,
           format,
@@ -1280,7 +1415,10 @@ app.post("/generate/fill-blank", async (req, res) => {
     // Prefer deterministic output over free-form LLM rewrite when possible.
     // This avoids invalid pseudo-answers (e.g., non-words) from legacy fallback prompts.
     const deterministicFallback = scored.find(
-      (s) => validateGenerated(s.item.text, format, { expectedBlankCount }).ok
+      (s) =>
+        validateGenerated(s.item.text, format, { expectedBlankCount }).ok &&
+        // Avoid returning near-copy garbage when overlap is extremely high.
+        s.jaccard <= 0.8
     );
     if (deterministicFallback) {
       const slots = extractBlankSlots(deterministicFallback.item.text);
@@ -1288,8 +1426,14 @@ app.post("/generate/fill-blank", async (req, res) => {
       return res.json({
         item: deterministicFallback.item,
         displayText: deterministicFallback.item.text,
-        answerKey: [deterministicFallback.item.correct],
-        answers: [deterministicFallback.item.correct],
+        answerKey:
+          (deterministicFallback.item as { answerKey?: string[] }).answerKey || [
+            deterministicFallback.item.correct,
+          ],
+        answers:
+          (deterministicFallback.item as { answerKey?: string[] }).answerKey || [
+            deterministicFallback.item.correct,
+          ],
         slots,
         candidates: scored,
         format,
@@ -1322,52 +1466,29 @@ app.post("/generate/fill-blank", async (req, res) => {
       const pattern = getBlankPattern(cleanedSourceText);
       const system =
         "You generate fill-in-the-blank questions. Return ONLY valid JSON. Never copy the original sentence.";
-      const prompt =
-        format === "prefix_blank" && pattern && expectedBlankCount === 1
-          ? [
-              "Create ONE new sentence similar in meaning but NOT a copy.",
-              "Change the subject and clause order. Replace key phrases with synonyms.",
-              "Do NOT reuse any 3-word sequence from the original.",
-              "Ensure at least 30% of content words are different.",
-              "Keep EXACT prefix blank pattern.",
-              `Prefix: ${pattern.prefix}`,
-              `Blanks: ${pattern.blanks}`,
-              `Total answer length: ${pattern.prefix.length + pattern.blankCount} letters.`,
-              `Answer must start with "${pattern.prefix}" and have exactly ${pattern.blankCount} letters after the prefix.`,
-              "The text must include the full sentence with the blank in place of the answer. Do not truncate after the blank.",
-              "Infer the original answer from context, then choose a DIFFERENT valid answer with the same prefix and length.",
-              "Return JSON: {\"text\":\"...\", \"answer\":\"...\", \"original\":\"...\"}",
-              "The answer must start with the prefix and match total length implied by blanks. Never reuse the original answer.",
-              "Do not add choices or explanations.",
-              target
-                ? `Target difficulty profile: L=${target.L.toFixed(2)}, S=${target.S.toFixed(
-                    2
-                  )}, A=${target.A.toFixed(2)}, R=${target.R.toFixed(2)}.`
-                : "Target difficulty profile: not provided.",
-              `Slot constraints: ${slotConstraintSummary}`,
-              `Original: ${cleanedSourceText}`,
-            ].join("\n")
-          : [
-              "Create ONE new sentence similar in meaning but NOT a copy.",
-              "Change the subject and clause order. Replace key phrases with synonyms.",
-              "Do NOT reuse any 3-word sequence from the original.",
-              "Ensure at least 30% of content words are different.",
-              "Keep EXACT one blank marked with ____.",
-              expectedBlankCount > 1
-                ? `Return JSON: {"text":"...", "answers":["..."]} with exactly ${expectedBlankCount} answers in order.`
-                : "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
-              expectedBlankCount > 1
-                ? `For each answers[i], obey slot rule i: ${slotConstraintSummary}. Each answer must be a single word with matching prefix and total length.`
-                : "",
-              "Do not add choices or explanations.",
-              target
-                ? `Target difficulty profile: L=${target.L.toFixed(2)}, S=${target.S.toFixed(
-                    2
-                  )}, A=${target.A.toFixed(2)}, R=${target.R.toFixed(2)}.`
-                : "Target difficulty profile: not provided.",
-              `Slot constraints: ${slotConstraintSummary}`,
-              `Original: ${cleanedSourceText}`,
-            ].join("\n");
+      const prompt = [
+        "Create ONE new sentence similar in meaning but NOT a copy.",
+        "Change the subject and clause order. Replace key phrases with synonyms.",
+        "Do NOT reuse any 3-word sequence from the original.",
+        "Ensure at least 30% of content words are different.",
+        format === "prefix_blank"
+          ? "Use prefix+underscores blank format, but DO NOT reuse source prefix."
+          : "Keep EXACT one blank marked with ____.",
+        expectedBlankCount > 1
+          ? `Return JSON: {"text":"...", "answers":["..."]} with exactly ${expectedBlankCount} answers in order.`
+          : "Return JSON: {\"text\":\"...\", \"answer\":\"...\"}",
+        expectedBlankCount > 1
+          ? `For each answers[i], obey slot rule i (length reference): ${slotConstraintSummary}.`
+          : "",
+        "Do not add choices or explanations.",
+        target
+          ? `Target difficulty profile: L=${target.L.toFixed(2)}, S=${target.S.toFixed(
+              2
+            )}, A=${target.A.toFixed(2)}, R=${target.R.toFixed(2)}.`
+          : "Target difficulty profile: not provided.",
+        `Slot constraints: ${slotConstraintSummary}`,
+        `Original: ${cleanedSourceText}`,
+      ].join("\n");
 
       for (let i = 0; i < 3; i += 1) {
         llmAttempted = true;
@@ -1465,33 +1586,17 @@ app.post("/generate/fill-blank", async (req, res) => {
 
         if (format === "prefix_blank" && pattern && expectedBlankCount === 1) {
           const rawAnswer = String(answerList[0] || "").trim();
-          const lowerPrefix = pattern.prefix.toLowerCase();
           const rawOriginal = String((parsed as { original?: string }).original || "").trim();
-          let fullAnswer = rawAnswer;
-          if (rawAnswer.toLowerCase().startsWith(lowerPrefix)) {
-            fullAnswer = rawAnswer;
-          } else if (rawAnswer.length > 0) {
-            // If model returned only missing part, prepend prefix.
-            // Do not force legacy blank length here; keep generation flexible and align blank later.
-            const suffix = rawAnswer.slice(0, Math.max(rawAnswer.length, 1));
-            fullAnswer = `${pattern.prefix}${suffix}`;
-          } else {
-            llmLastValidationReason = "Answer does not start with required prefix.";
+          const fullAnswer = rawAnswer.replace(/\s+/g, "").toLowerCase().replace(/[^a-z]/g, "");
+          if (fullAnswer.length < 3) {
+            llmLastValidationReason = "Answer too short for prefix blank.";
             continue;
           }
-          rewritten = harmonizeSingleBlankWithAnswer(
-            rewritten,
-            "prefix_blank",
-            fullAnswer,
-            pattern
-          );
+          rewritten = harmonizePrefixBlankWithoutSourcePrefix(rewritten, fullAnswer);
           answerList = [fullAnswer];
           if (rawOriginal) {
-            const normalizedOriginal = rawOriginal.toLowerCase();
-            const originalFull = normalizedOriginal.startsWith(lowerPrefix)
-              ? normalizedOriginal
-              : `${lowerPrefix}${normalizedOriginal}`;
-            if (answerList[0].toLowerCase() === originalFull) {
+            const normalizedOriginal = rawOriginal.toLowerCase().replace(/\s+/g, "").replace(/[^a-z]/g, "");
+            if (answerList[0].toLowerCase() === normalizedOriginal) {
               llmLastValidationReason = "Answer reused the original word.";
               continue;
             }
@@ -1515,8 +1620,8 @@ app.post("/generate/fill-blank", async (req, res) => {
               multiRuleOk = false;
               break;
             }
-            if (rule.prefix && !ans.startsWith(rule.prefix.toLowerCase())) {
-              llmLastValidationReason = `Answer ${idx + 1} does not start with required prefix.`;
+            if (rule && rule.missingCount > 0 && Math.abs(ans.length - (rule.missingCount + 2)) > 4) {
+              llmLastValidationReason = `Answer ${idx + 1} length is far from target range.`;
               multiRuleOk = false;
               break;
             }
@@ -1632,8 +1737,8 @@ app.post("/generate/fill-blank", async (req, res) => {
       return res.json({
         item: fallback.item,
         displayText: fallback.item.text,
-        answerKey: [fallback.item.correct],
-        answers: [fallback.item.correct],
+        answerKey: (fallback.item as { answerKey?: string[] }).answerKey || [fallback.item.correct],
+        answers: (fallback.item as { answerKey?: string[] }).answerKey || [fallback.item.correct],
         slots,
         candidates: scored,
         format,
@@ -2233,7 +2338,7 @@ app.post("/target/from-structure", (req, res) => {
   }
 });
 
-const PORT = 3001;
+const PORT = Number(process.env.PORT || 3001);
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
