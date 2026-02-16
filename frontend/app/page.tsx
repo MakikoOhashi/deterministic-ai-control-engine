@@ -46,7 +46,7 @@ type ChoiceStructure = {
   isolationIndex: number;
 };
 
-type TaskType = "context_completion" | "guided_reading";
+type TaskType = "guided_reading";
 
 type ParsedBlank = {
   prefix: string;
@@ -112,7 +112,7 @@ export default function Home() {
   const [question, setQuestion] = useState("");
   const [choices, setChoices] = useState<string[]>([]);
   const [correctIndex, setCorrectIndex] = useState<number | null>(null);
-  const [taskType, setTaskType] = useState<TaskType>("context_completion");
+  const taskType: TaskType = "guided_reading";
   const [typedAnswer, setTypedAnswer] = useState("");
   const [contextSlots, setContextSlots] = useState<BlankSlot[]>([]);
   const [contextAnswers, setContextAnswers] = useState<string[]>([]);
@@ -149,13 +149,33 @@ export default function Home() {
     candidateId?: string;
     stage?: string;
   } | null>(null);
-  const parsedBlank = useMemo(
-    () => (taskType === "context_completion" ? parsePrimaryBlank(question) : null),
-    [taskType, question]
-  );
+  const parsedBlank = useMemo(() => parsePrimaryBlank(question), [question]);
   const sortedContextSlots = useMemo(
     () => [...contextSlots].sort((a, b) => a.start - b.start),
     [contextSlots]
+  );
+  const displayContextSlots = useMemo(
+    () =>
+      sortedContextSlots.map((slot, idx) => {
+        const answer = (contextAnswerKey[idx] || "").trim().toLowerCase();
+        const rawPrefix = slot.prefix || "";
+        const prefixValid = Boolean(rawPrefix) && answer.startsWith(rawPrefix.toLowerCase());
+        let uiPrefix = prefixValid ? rawPrefix : "";
+        if (!prefixValid && sourcePrefixMode === "hasPrefix" && answer.length >= 3) {
+          const inferredLen = Math.max(
+            1,
+            Math.min(3, answer.length - Math.max(2, Math.min(slot.missingCount, answer.length - 1)))
+          );
+          uiPrefix = answer.slice(0, inferredLen);
+        }
+        const uiMissingCount = uiPrefix
+          ? Math.max(answer.length - uiPrefix.length, 1)
+          : Math.max(answer.length, 1);
+        const detachedPrefix =
+          prefixValid || sourcePrefixMode === "hasPrefix" ? "" : rawPrefix;
+        return { ...slot, uiPrefix, uiMissingCount, detachedPrefix };
+      }),
+    [sortedContextSlots, contextAnswerKey, sourcePrefixMode]
   );
 
   useEffect(() => {
@@ -271,7 +291,7 @@ export default function Home() {
         throw new Error(err.error || "Structuring failed.");
       }
       const data = (await res.json()) as {
-        taskType?: TaskType;
+        taskType?: "context_completion" | "guided_reading";
         normalizedText?: string;
         displayText?: string;
         answerKey?: string[];
@@ -284,10 +304,6 @@ export default function Home() {
         };
       };
       const payload = data.payload;
-      const nextTaskType = payload?.taskType || data.taskType;
-      if (nextTaskType && nextTaskType !== taskType) {
-        setTaskType(nextTaskType);
-      }
       const normalized = (payload?.displayText || data.displayText || data.normalizedText || input).trim();
       setSourceAnswerKey(
         Array.isArray(payload?.sourceAnswerKey)
@@ -306,9 +322,6 @@ export default function Home() {
       const inferredSlotCount = Math.max(fromPayload, fromText, fromAnswerKey, 1);
       setSourceSlotCount(Math.max(1, Math.min(2, inferredSlotCount)));
       setSourcePrefixMode(payload?.extraction?.prefixMode === "hasPrefix" ? "hasPrefix" : "none");
-      if (taskType === "context_completion" && !/[_*]{2,}/.test(normalized)) {
-        throw new Error("Could not detect blanks from input. Please use a clearer image or add underscores manually.");
-      }
       setBaselineSources(normalized);
       return normalized;
     } finally {
@@ -321,20 +334,15 @@ export default function Home() {
     setError(null);
     setWarning(null);
     try {
-      const targetEndpoint =
-        taskType === "guided_reading" ? "/target/from-sources-mc" : "/target/from-sources";
-      const res = await fetch(`${apiBase}${targetEndpoint}`, {
+      const res = await fetch(`${apiBase}/target/from-sources-mc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sourceTexts:
-            taskType === "context_completion"
-              ? [(sourceOverride || baselineSources).trim()].filter(Boolean)
-              : (sourceOverride || baselineSources)
-                  .split(/\n\s*\n/)
-                  .map((s) => s.trim())
-                  .filter(Boolean)
-                  .slice(0, 3),
+          sourceTexts: (sourceOverride || baselineSources)
+            .split(/\n\s*\n/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .slice(0, 3),
         }),
       });
       if (!res.ok) {
@@ -372,26 +380,6 @@ export default function Home() {
     }
   };
 
-  useEffect(() => {
-    setPassage("");
-    setQuestion("");
-    setChoices([]);
-    setCorrectIndex(null);
-    setCorrectText("");
-    setSelected(null);
-    setTypedAnswer("");
-    setContextSlots([]);
-    setContextAnswers([]);
-    setContextAnswerKey([]);
-    setTargetBand(null);
-    setAxisTolerance(null);
-    setSourceAnswerKey([]);
-    setSourceSlotCount(1);
-    setSourcePrefixMode("none");
-    setRunMeta(null);
-    setSubmitted(false);
-  }, [taskType]);
-
   const handleGenerate = async (
     targetOverride?: Components | null,
     sourceOverride?: string | null
@@ -400,27 +388,16 @@ export default function Home() {
     setError(null);
     try {
       const sourceText =
-        taskType === "context_completion"
-          ? (sourceOverride || baselineSources).trim()
-          : (sourceOverride || baselineSources)
-              .split(/\n\s*\n/)
-              .map((s) => s.trim())
-              .filter(Boolean)[0] || "";
-      const endpoint =
-        taskType === "guided_reading" ? "/generate/mc" : "/generate/fill-blank";
-      const res = await fetch(`${apiBase}${endpoint}`, {
+        (sourceOverride || baselineSources)
+          .split(/\n\s*\n/)
+          .map((s) => s.trim())
+          .filter(Boolean)[0] || "";
+      const res = await fetch(`${apiBase}/generate/mc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sourceText,
           target: targetOverride ?? target,
-          sourceAnswers: taskType === "context_completion" ? sourceAnswerKey : undefined,
-          expectedBlankCount:
-            taskType === "context_completion"
-              ? Math.max(1, Math.min(2, sourceSlotCount))
-              : undefined,
-          prefixMode:
-            taskType === "context_completion" ? sourcePrefixMode : undefined,
         }),
       });
       if (!res.ok) {
@@ -444,32 +421,17 @@ export default function Home() {
         candidateId?: string;
         debug?: { stage?: string };
       };
-      if (taskType === "guided_reading") {
-        const item = data.item as {
-          passage?: string | null;
-          question: string;
-          choices: string[];
-          correctIndex: number;
-        };
-        setPassage(item.passage || "");
-        setQuestion(item.question);
-        setChoices(item.choices);
-        setCorrectIndex(item.correctIndex);
-        setCorrectText(item.choices[item.correctIndex] || "");
-      } else {
-        const item = data.item as { text: string; correct: string; distractors: string[] };
-        setPassage("");
-        setQuestion(data.displayText || item.text);
-        const slots = Array.isArray(data.slots) ? data.slots : [];
-        const answerKey = Array.isArray(data.answerKey) ? data.answerKey : [item.correct];
-        setContextSlots(slots);
-        setContextAnswerKey(answerKey);
-        setContextAnswers(Array.from({ length: answerKey.length }, () => ""));
-        const auditChoices = [item.correct, ...item.distractors];
-        setChoices(auditChoices);
-        setCorrectIndex(0);
-        setCorrectText(item.correct);
-      }
+      const item = data.item as {
+        passage?: string | null;
+        question: string;
+        choices: string[];
+        correctIndex: number;
+      };
+      setPassage(item.passage || "");
+      setQuestion(item.question);
+      setChoices(item.choices);
+      setCorrectIndex(item.correctIndex);
+      setCorrectText(item.choices[item.correctIndex] || "");
       setSimilarity(typeof data.similarity === "number" ? data.similarity : null);
       setWarning(data.similarityWarning ?? null);
       setSimilarityBreakdown(data.similarityBreakdown ?? null);
@@ -545,29 +507,8 @@ export default function Home() {
     }
   };
 
-  const correctChoice =
-    taskType === "guided_reading"
-      ? correctIndex != null && choices[correctIndex]
-        ? choices[correctIndex]
-        : ""
-      : correctText;
-  const contextSubmittedAnswer =
-    taskType === "context_completion" && parsedBlank
-      ? `${parsedBlank.prefix}${typedAnswer}`
-      : typedAnswer;
-  const contextSubmittedList =
-    sortedContextSlots.length > 0
-      ? sortedContextSlots.map((slot, idx) => `${slot.prefix ?? ""}${contextAnswers[idx] || ""}`)
-      : [contextSubmittedAnswer];
-  const isCorrect =
-    submitted &&
-    (taskType === "guided_reading"
-      ? selected === correctChoice
-      : sortedContextSlots.length > 0
-      ? contextSubmittedList.every(
-          (v, i) => v.trim().toLowerCase() === (contextAnswerKey[i] || "").trim().toLowerCase()
-        )
-      : contextSubmittedAnswer.trim().toLowerCase() === correctChoice.trim().toLowerCase());
+  const correctChoice = correctIndex != null && choices[correctIndex] ? choices[correctIndex] : "";
+  const isCorrect = submitted && selected === correctChoice;
 
   const hints = [
     target && result
@@ -597,26 +538,13 @@ export default function Home() {
         <div className="mode-bar">
           <div className="mode-title">Task Type</div>
           <div className="mode-buttons">
-            <button
-              className={`mode-button ${taskType === "context_completion" ? "active" : ""}`}
-              onClick={() => setTaskType("context_completion")}
-              type="button"
-            >
-              Context Completion
-            </button>
-            <button
-              className={`mode-button ${taskType === "guided_reading" ? "active" : ""}`}
-              onClick={() => setTaskType("guided_reading")}
-              type="button"
-            >
-              Guided Reading
+            <button className="mode-button active" type="button">
+              Guided Reading (v1)
             </button>
           </div>
         </div>
         <div className="mode-note">
-          {taskType === "context_completion"
-            ? "Fill missing words using context."
-            : "Read a short passage and answer inference questions."}
+          Read a passage and answer one inference question with 4 choices.
         </div>
         <div className="field">
           <label>Paste target examples (1–3)</label>
@@ -667,135 +595,24 @@ export default function Home() {
               <div className="generated-title">Generated Question</div>
               {passage ? <div className="generated-text">{passage}</div> : null}
               <div className="generated-text">{question || "—"}</div>
-              {taskType === "guided_reading" ? (
-                <div className="options">
-                  {choices.filter(Boolean).map((opt) => (
-                    <label key={opt} className="option">
-                      <input
-                        type="radio"
-                        name="answer"
-                        value={opt}
-                        checked={selected === opt}
-                        onChange={() => setSelected(opt)}
-                      />
-                      <span>{opt}</span>
-                    </label>
-                  ))}
-                </div>
-              ) : (
-                <div className="context-completion">
-                  <div className="context-heading">Complete the text with the correct word</div>
-                  <div className="context-text">
-                    {sortedContextSlots.length > 0 ? (
-                      <>
-                        {(() => {
-                          const nodes: ReactNode[] = [];
-                          let cursor = 0;
-                          sortedContextSlots.forEach((slot, slotIdx) => {
-                            const start = Math.max(0, Math.min(slot.start, question.length));
-                            const end = Math.max(start, Math.min(slot.end, question.length));
-                            nodes.push(question.slice(cursor, start));
-                            nodes.push(
-                              <span key={`slot-inline-${slotIdx}`} className="context-blank">
-                                {slot.prefix
-                                  .split("")
-                                  .filter(Boolean)
-                                  .map((ch, idx) => (
-                                    <span key={`p-${slotIdx}-${idx}`} className="blank-cell fixed">
-                                      {ch}
-                                    </span>
-                                  ))}
-                                {Array.from({ length: slot.missingCount }).map((_, idx) => (
-                                  <input
-                                    key={`m-${slotIdx}-${idx}`}
-                                    className="blank-cell blank-input"
-                                    value={contextAnswers[slotIdx]?.[idx] || ""}
-                                    onChange={(e) => {
-                                      const char = (e.target.value || "").slice(-1);
-                                      setContextAnswers((prev) => {
-                                        const cloned = [...prev];
-                                        const current = (cloned[slotIdx] || "").padEnd(
-                                          slot.missingCount,
-                                          " "
-                                        );
-                                        const arr = current.split("");
-                                        arr[idx] = char || " ";
-                                        cloned[slotIdx] = arr.join("").trimEnd();
-                                        return cloned;
-                                      });
-                                    }}
-                                    maxLength={1}
-                                  />
-                                ))}
-                              </span>
-                            );
-                            cursor = end;
-                          });
-                          nodes.push(question.slice(cursor));
-                          return nodes;
-                        })()}
-                      </>
-                    ) : parsedBlank ? (
-                      <>
-                        {question.slice(0, parsedBlank.start)}
-                        <span className="context-blank">
-                          {parsedBlank.prefix
-                            .split("")
-                            .filter(Boolean)
-                            .map((ch, idx) => (
-                              <span key={`p-${idx}`} className="blank-cell fixed">
-                                {ch}
-                              </span>
-                            ))}
-                          {Array.from({ length: parsedBlank!.missingCount }).map((_, idx) => (
-                            <input
-                              key={`m-${idx}`}
-                              className="blank-cell blank-input"
-                              value={typedAnswer[idx] || ""}
-                              onChange={(e) => {
-                                const char = (e.target.value || "").slice(-1);
-                                setTypedAnswer((prev) => {
-                                  const arr = Array.from({ length: parsedBlank!.missingCount }).map(
-                                    (_x, i) => prev[i] || ""
-                                  );
-                                  arr[idx] = char;
-                                  return arr.join("");
-                                });
-                              }}
-                              maxLength={1}
-                            />
-                          ))}
-                        </span>
-                        {question.slice(parsedBlank.end)}
-                      </>
-                    ) : (
-                      question || "—"
-                    )}
-                  </div>
-                  {sortedContextSlots.length > 0 || parsedBlank ? null : (
-                    <div className="field">
-                      <label>Your answer</label>
-                      <input
-                        value={typedAnswer}
-                        onChange={(e) => setTypedAnswer(e.target.value)}
-                        placeholder="Type the missing word(s)"
-                      />
-                    </div>
-                  )}
-                </div>
-              )}
+              <div className="options">
+                {choices.filter(Boolean).map((opt) => (
+                  <label key={opt} className="option">
+                    <input
+                      type="radio"
+                      name="answer"
+                      value={opt}
+                      checked={selected === opt}
+                      onChange={() => setSelected(opt)}
+                    />
+                    <span>{opt}</span>
+                  </label>
+                ))}
+              </div>
               <div className="actions">
                 <button
                   onClick={() => setSubmitted(true)}
-                  disabled={
-                    taskType === "guided_reading"
-                      ? !selected
-                      : sortedContextSlots.length > 0
-                      ? sortedContextSlots.some(
-                          (slot, idx) => (contextAnswers[idx] || "").trim().length < slot.missingCount
-                        )
-                      : !typedAnswer.trim()
-                  }
+                  disabled={!selected}
                 >
                   Submit Answer
                 </button>
@@ -805,11 +622,7 @@ export default function Home() {
               </div>
               {submitted ? (
                 <div className={isCorrect ? "result good" : "result bad"}>
-                  {isCorrect
-                    ? "Correct"
-                    : sortedContextSlots.length > 0
-                    ? `Correct answers: ${contextAnswerKey.join(", ")}`
-                    : `Correct answer: ${correctChoice}`}
+                  {isCorrect ? "Correct" : `Correct answer: ${correctChoice}`}
                 </div>
               ) : null}
             </div>

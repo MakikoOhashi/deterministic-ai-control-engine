@@ -27,10 +27,10 @@ npm run dev
 ---
 
 ## 現在の対応タスク
-- `Context Completion`（空欄補充）
-- `Guided Reading`（短文読解 + 選択肢）
+- `Guided Reading`（Passage + Inference Question + 4 Choices）
 
-> `Mode B (Concept Preservation)` は将来拡張として設計のみ。v1の主軸は `Mode A`。
+> v1は `Mode A (Free Domain)` を主軸にした **TOEFL-like 読解形式** に固定。
+> `Context Completion` と `Mode B` は将来拡張。
 
 ---
 
@@ -63,7 +63,7 @@ flowchart TD
   C --> C2["debug"]
   C1 --> D["target_from_sources"]
   D --> E["target mean + targetBand + axisTolerance"]
-  E --> F["generate_fill_blank or generate_mc"]
+  E --> F["generate_mc"]
   F --> G["Format Validation"]
   G --> H["Similarity + Difficulty Distance + Reuse Check"]
   H -->|pass| I["Return Generated Item"]
@@ -72,17 +72,17 @@ flowchart TD
 
 ---
 
-## Execution Spec（Upload → Generation）
+## Execution Spec（Upload/Paste → Generation）
 
 ### 1. User Input
 - `ocrFile`（画像）または `baselineSources`（テキスト）
-- `taskType`（`context_completion` / `guided_reading`）
+- `taskType` は v1で `guided_reading` 固定
 
 ### 2. Frontend Image Preprocess
 - 関数: `fileToResizedBase64(file, 1024)`
 - 目的: 長辺 1024px に縮小して推論コストを削減
-- API: `POST /vision/extract-slots`
-- 使用項目: `slots[]`（`prefix`, `missingCount`, `confidence`）
+- API: `POST /vision/extract-slots`（best-effort）
+- 使用項目: OCR補助（主生成はMCパース）
 
 ### 3. OCR
 - 関数: `tesseract.recognize(...)`
@@ -97,38 +97,28 @@ flowchart TD
 - `visionSlots`（任意）
 
 内部処理（backend）:
-- `normalizePrefixUnderscorePatterns`
+- `parseMultipleChoice`（passage/question/choices/answer抽出）
 - `classifyFormat`
-- `extractBlankSlots`
-- 必要時: LLM補正（`generationProvider.generateText`）
-- 必要時: regex fallback
+- 必要時: heuristic parse fallback
 
 出力は `payload` / `debug` を分離:
 
 ```json
 {
   "payload": {
-    "taskType": "context_completion",
-    "format": "prefix_blank",
-    "displayText": "... fa__ ...",
-    "sourceAnswerKey": ["fail"],
-    "slotCount": 1,
-    "slots": [
-      { "prefix": "fa", "missingCount": 2, "slotConfidence": 0.82 }
-    ],
+    "taskType": "guided_reading",
+    "displayText": "Passage: ...",
     "textFeatures": {
-      "wordCount": 48,
-      "textLengthBucket": "short",
-      "cefr": "B2",
-      "lexical": 0.31,
-      "structural": 0.28
+      "wordCount": 136,
+      "textLengthBucket": "medium",
+      "cefr": "C1",
+      "lexical": 0.34,
+      "structural": 0.29
     }
   },
   "debug": {
     "rawOcrText": "...",
-    "aiNormalizedText": "...",
-    "normalizedText": "...",
-    "slotInference": "vision_ai"
+    "normalizedText": "..."
   }
 }
 ```
@@ -137,7 +127,7 @@ Frontendで使うのは原則 `payload`:
 - `payload.displayText` → 生成入力の基準テキスト
 - `payload.sourceAnswerKey` → 再利用禁止用 `sourceAnswers`
 
-### 5. Target Build（`POST /target/from-sources`）
+### 5. Target Build（`POST /target/from-sources-mc`）
 
 入力:
 - `sourceTexts[]`

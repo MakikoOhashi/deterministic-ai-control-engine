@@ -704,6 +704,10 @@ function buildBlankedCandidateFromFullText(
     end: number;
     rule: { missingCount: number };
   }> = [];
+  const isTailWord = (end: number) => {
+    const tail = fullText.slice(end).trim();
+    return !tail || /^[.!?]+$/.test(tail);
+  };
 
   const choosePrefixLength = (
     word: string,
@@ -736,7 +740,7 @@ function buildBlankedCandidateFromFullText(
 
     if (requested) {
       selectedIndex = words.findIndex(
-        (w, idx) => !used.has(idx) && w.word.toLowerCase() === requested
+        (w, idx) => !used.has(idx) && !isTailWord(w.end) && w.word.toLowerCase() === requested
       );
     }
 
@@ -745,13 +749,16 @@ function buildBlankedCandidateFromFullText(
       selectedIndex = words.findIndex(
         (w, idx) =>
           !used.has(idx) &&
+          !isTailWord(w.end) &&
           w.word.length >= 4 &&
           Math.abs(w.word.length - targetLen) <= 2
       );
     }
 
     if (selectedIndex < 0) {
-      selectedIndex = words.findIndex((w, idx) => !used.has(idx) && w.word.length >= 4);
+      selectedIndex = words.findIndex(
+        (w, idx) => !used.has(idx) && !isTailWord(w.end) && w.word.length >= 4
+      );
     }
     if (selectedIndex < 0) return null;
     used.add(selectedIndex);
@@ -814,6 +821,21 @@ function validateBlankedCandidateShape(
     const slot = slots[i];
     const ans = String(answerKey[i] || "").replace(/\s+/g, "").toLowerCase();
     if (!slot || !ans) return { ok: false, reason: `Missing answer at index ${i}.` };
+    const tailAfterSlot = text.slice(slot.end).trim();
+    if (!tailAfterSlot || /^[.!?]+$/.test(tailAfterSlot)) {
+      return { ok: false, reason: "Blank cannot be final token." };
+    }
+    // Reject orphan trailing blanks like ". ac_____" appended after a complete sentence.
+    let j = slot.start - 1;
+    while (j >= 0 && /\s/.test(text[j] || "")) j -= 1;
+    const prevChar = j >= 0 ? text.charAt(j) : "";
+    if (/[.!?]/.test(prevChar)) {
+      const tail = text.slice(slot.end).trim();
+      // If nothing meaningful follows this slot, treat it as malformed append.
+      if (!tail || /^[.!?]*$/.test(tail)) {
+        return { ok: false, reason: "Orphan trailing blank token." };
+      }
+    }
     if (prefixMode) {
       if (!slot.prefix) return { ok: false, reason: "Expected prefix hint before blank." };
       const expectedMissing = ans.length - slot.prefix.length;
@@ -886,7 +908,8 @@ app.post("/ocr/structure", async (req, res) => {
     }
 
     let aiNormalizedText = rawOcrText;
-    if (generationProvider) {
+    const ENABLE_LEGACY_LLM_FALLBACK = false;
+    if (generationProvider && ENABLE_LEGACY_LLM_FALLBACK) {
       const system =
         "You normalize OCR text for context-completion tasks. Return ONLY plain text.";
       const prompt = [
@@ -1124,7 +1147,7 @@ app.post("/generate/fill-blank", async (req, res) => {
         2
       )
     );
-    let candidates = generateFillBlankCandidates(cleanedSourceText);
+    let candidates = generationProvider ? [] : generateFillBlankCandidates(cleanedSourceText);
     if (candidates.length === 0 && !generationProvider) {
       return res.status(422).json({
         error: "Could not generate a valid blank candidate from this source.",
