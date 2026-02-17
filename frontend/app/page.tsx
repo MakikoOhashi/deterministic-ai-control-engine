@@ -455,11 +455,11 @@ export default function Home() {
           Read a passage and answer one inference question with 4 choices.
         </div>
         <div className="field">
-          <label>Paste target examples (1–3)</label>
+          <label>Paste target example (1 passage and 1 question with 4 choices)</label>
           <textarea
             value={baselineSources}
             onChange={(e) => setBaselineSources(e.target.value)}
-            placeholder="Separate examples with a blank line."
+            placeholder={"Passage:\n...\n\nQuestion:\n...\n\nChoices:\nA) ...\nB) ...\nC) ...\nD) ..."}
           />
         </div>
         <div className="field">
