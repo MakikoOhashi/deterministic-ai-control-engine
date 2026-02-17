@@ -24,6 +24,15 @@ npm run dev
   - frontend: `3000`
   - backend: `3001`（`PORT` で変更可）
 
+### v1 Typecheck（提出範囲のみ）
+
+```bash
+npm run typecheck:v1
+```
+
+- backend: `tsconfig.v1.json`（v1経路を対象）
+- frontend: `tsc --noEmit`
+
 ---
 
 ## 現在の対応タスク
@@ -50,6 +59,16 @@ LLMは候補生成器。最終採用は評価側で決定。
 - `debug`: 生OCR/整形結果などの観測情報（監査・開発用）
 
 これにより「どの中間表現を正とするか」の混乱を避けます。
+
+### API Contract（single source）
+
+- 共通契約は `/Users/makiko/Documents/Documents - makiko’s MacBook Air/dev/deterministic-ai-control-engine/shared/api.ts`
+- v1で共通化済み:
+  - `POST /generate/mc`
+  - `POST /target/from-sources-mc`
+- 返却は discriminated union:
+  - success: `{ ok: true, apiVersion: "v1", ... }`
+  - error: `{ ok: false, apiVersion: "v1", errorType, ... }`
 
 ---
 

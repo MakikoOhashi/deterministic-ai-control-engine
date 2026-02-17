@@ -55,7 +55,7 @@ export async function computeTargetFromSources(
   sourceTexts: string[],
   provider: EmbeddingProvider,
   maxSteps = 5
-): ProfileStats {
+): Promise<ProfileStats> {
   const items = sourceTexts.filter((s) => s.trim().length > 0);
   if (items.length === 0) {
     throw new Error("sourceTexts must include at least one item.");

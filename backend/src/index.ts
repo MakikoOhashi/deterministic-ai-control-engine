@@ -34,14 +34,16 @@ import { validateGenerated } from "./services/format-validator.service.js";
 import { cosineSimilarity } from "./utils/cosine.js";
 import { countWords } from "./utils/text-metrics.js";
 import { GeminiTextGenerationProvider } from "./providers/gemini.generate.provider.js";
+import type {
+  GenerateMcRequest,
+  GenerateMcError,
+  TargetFromSourcesMcRequest,
+  MultipleChoiceItem as ContractMultipleChoiceItem,
+} from "../../shared/api.js";
 
-type MultipleChoiceItem = {
-  passage?: string | null;
-  question: string;
-  choices: string[];
-  correctIndex: number;
-  subtype?: "combo" | "standard";
-};
+const API_VERSION = "v1" as const;
+
+type MultipleChoiceItem = ContractMultipleChoiceItem & { subtype?: "combo" | "standard" };
 
 type StructureItem = {
   label: string;
@@ -132,7 +134,12 @@ app.post("/difficulty/semantic-ambiguity", (req, res) => {
     return res.json({ A: score });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    return res.status(400).json({ error: message });
+    return res.status(400).json({
+      ok: false,
+      apiVersion: API_VERSION,
+      error: message,
+      errorType: "BAD_REQUEST",
+    });
   }
 });
 
@@ -1812,23 +1819,36 @@ app.post("/generate/fill-blank", async (req, res) => {
 
 app.post("/generate/mc", async (req, res) => {
   try {
-    const { sourceText, target, mode } = req.body as {
-      sourceText: string;
-      target?: { L: number; S: number; A: number; R: number };
-      mode?: "A" | "B";
-    };
+    const { sourceText, target, mode, inferenceStyle } = req.body as GenerateMcRequest;
+    const badRequest = (message: string, extra?: Partial<GenerateMcError>) =>
+      res.status(400).json({
+        ok: false,
+        apiVersion: API_VERSION,
+        error: message,
+        errorType: "BAD_REQUEST",
+        ...extra,
+      } satisfies GenerateMcError);
     if (!sourceText || typeof sourceText !== "string") {
-      return res.status(400).json({ error: "sourceText is required." });
+      return badRequest("sourceText is required.");
     }
+    const runId = randomUUID();
+    const sourceId = createHash("sha1").update(sourceText).digest("hex").slice(0, 12);
+    let stage:
+      | "source_received"
+      | "source_parsed"
+      | "passage_generated"
+      | "candidate_generated"
+      | "validation_failed"
+      | "similarity_rejected"
+      | "accepted" = "source_received";
     if (!generationProvider) {
-      return res.status(400).json({ error: "Generation provider not configured." });
+      return badRequest("Generation provider not configured.");
     }
     if (mode === "B") {
-      return res.status(400).json({
-        error: "Mode B is planned for a future release. v1 supports Mode A only.",
-      });
+      return badRequest("Mode B is planned for a future release. v1 supports Mode A only.");
     }
     const sourceItem = await parseMultipleChoice(sourceText);
+    stage = "source_parsed";
     const useComboStyle = detectJapaneseCombinationStyle(sourceText);
     const statementLabels = useComboStyle ? extractJapaneseStatementLabels(sourceText) : [];
     const expectedSubtype = sourceItem.subtype || (useComboStyle ? "combo" : "standard");
@@ -1849,7 +1869,7 @@ app.post("/generate/mc", async (req, res) => {
       : 0;
     const passageMin = hasPassage ? Math.max(60, passageLength - 15) : 0;
     const passageMax = hasPassage ? passageLength + 15 : 0;
-    const choiceCount = sourceItem.choices.length;
+    const choiceCount = 4;
     const passageHint = hasPassage
       ? `Passage length: ${passageMin}-${passageMax} words.`
       : "No passage. Only a question.";
@@ -1896,8 +1916,9 @@ app.post("/generate/mc", async (req, res) => {
         }
       }
       if (!fixedPassage) {
-        return res.status(400).json({ error: "Failed to generate passage within length range." });
+        return badRequest("Failed to generate passage within length range.");
       }
+      stage = "passage_generated";
     }
     const themeKeywords: string[] = [];
     const choiceIntent = null;
@@ -1919,6 +1940,13 @@ app.post("/generate/mc", async (req, res) => {
       `Keep exactly ${choiceCount} choices with exactly 1 correct answer.`,
       `Your choices array MUST have exactly ${choiceCount} items.`,
       "Question type: inference only.",
+      inferenceStyle === "fact_based"
+        ? "Inference style: fact-based (evidence-driven, objective tone)."
+        : inferenceStyle === "intent_based"
+        ? "Inference style: intent-based (speaker/actor goal and motivation)."
+        : inferenceStyle === "emotional"
+        ? "Inference style: emotional (attitude, feeling, tone inference)."
+        : "Inference style: fact-based by default.",
       "Use the same language as the source.",
       useComboStyle
         ? `Match the Japanese combination format: include statements labeled ${statementLabels.length ? statementLabels.join(", ") : "ア, イ, ウ, エ"} and choices like '1. アイ' '2. アウ' etc. Use the same number of statements as the source. The statements must be included in the output. Use different concepts than the source and avoid close paraphrase.`
@@ -1956,7 +1984,7 @@ app.post("/generate/mc", async (req, res) => {
       llmLastValidationReason = reason;
     };
 
-    const maxAttempts = expectedSubtype === "combo" ? 3 : 1;
+    const maxAttempts = expectedSubtype === "combo" ? 3 : 3;
     let best: {
       item: MultipleChoiceItem;
       sim: number;
@@ -1977,6 +2005,27 @@ app.post("/generate/mc", async (req, res) => {
       score: number;
       similarityWarning?: string;
     } | null = null;
+    let softAccepted: { item: MultipleChoiceItem; reason: string } | null = null;
+    let bestFallback: {
+      item: MultipleChoiceItem;
+      sim: number;
+      jaccard: number;
+      similarityBreakdown: {
+        passage: number | null;
+        question: number | null;
+        correctChoice: number | null;
+        distractors: number | null;
+        choices: number | null;
+      };
+      choiceStructure: {
+        correctMeanSim: number;
+        distractorMeanSim: number;
+        distractorVariance: number;
+        isolationIndex: number;
+      } | null;
+      score: number;
+      rejectionReason: string;
+    } | null = null;
 
     for (let i = 0; i < maxAttempts; i += 1) {
       llmAttempted = true;
@@ -1988,14 +2037,33 @@ app.post("/generate/mc", async (req, res) => {
         continue;
       }
       for (const parsed of candidates) {
+        stage = "candidate_generated";
         parsed.question = dedupeQuestionLines(parsed.question);
         parsed.choices = parsed.choices.map(normalizeChoice);
+        const repaired = coerceChoiceCount(parsed, choiceCount);
+        if (!repaired) {
+          setValidationReason("Choice count mismatch.");
+          continue;
+        }
+        parsed.choices = repaired.choices;
+        parsed.correctIndex = repaired.correctIndex;
         if (hasPassage && !useComboStyle && fixedPassage) {
           parsed.passage = fixedPassage;
           parsed.question = stripEmbeddedPassage(parsed.question, fixedPassage);
         }
-        if (parsed.choices.length !== choiceCount) {
-          setValidationReason("Choice count mismatch.");
+        const staticIssue = validateMultipleChoiceStrict(parsed, {
+          expectedChoiceCount: choiceCount,
+          requireInference: true,
+          passageText: parsed.passage || fixedPassage || sourceItem.passage || "",
+        });
+        if (staticIssue) {
+          setValidationReason(staticIssue);
+          if (!softAccepted) {
+            const basicIssue = validateMultipleChoice(parsed);
+            if (!basicIssue && !questionContainsChoices(parsed.question)) {
+              softAccepted = { item: parsed, reason: staticIssue };
+            }
+          }
           continue;
         }
         if (questionContainsChoices(parsed.question)) {
@@ -2090,12 +2158,8 @@ app.post("/generate/mc", async (req, res) => {
           sim >= minSim &&
           sim < 0.98 &&
           jaccard <= maxJaccard;
-        if (!allowHighSimCombo && (sim < minSim || sim > maxSim || jaccard > maxJaccard)) {
-          setValidationReason(
-            `Similarity out of range (sim=${sim.toFixed(3)}, jaccard=${jaccard.toFixed(3)}).`
-          );
-          continue;
-        }
+        const similarityOutOfRange =
+          !allowHighSimCombo && (sim < minSim || sim > maxSim || jaccard > maxJaccard);
         llmLastSim = sim;
         llmLastJaccard = jaccard;
         const textSim = async (a: string | null | undefined, b: string | null | undefined) => {
@@ -2130,6 +2194,20 @@ app.post("/generate/mc", async (req, res) => {
           correctChoiceSim != null && distractorSim != null
             ? (correctChoiceSim + distractorSim) / 2
             : correctChoiceSim ?? distractorSim;
+        if (expectedSubtype !== "combo") {
+          if (questionSim != null && questionSim > 0.94) {
+            setValidationReason("Question similarity too high.");
+            continue;
+          }
+          if (overallChoicesSim != null && overallChoicesSim > 0.92) {
+            setValidationReason("Choices similarity too high.");
+            continue;
+          }
+          if (passageSim != null && passageSim > 0.92) {
+            setValidationReason("Passage similarity too high.");
+            continue;
+          }
+        }
         let resolvedChoiceStructure: {
           correctMeanSim: number;
           distractorMeanSim: number;
@@ -2178,6 +2256,30 @@ app.post("/generate/mc", async (req, res) => {
           const dR = R - target.R;
           score = Math.sqrt(dL * dL + dS * dS + dA * dA + dR * dR);
         }
+        if (similarityOutOfRange) {
+          const rejectionReason = `Similarity out of range (sim=${sim.toFixed(
+            3
+          )}, jaccard=${jaccard.toFixed(3)}).`;
+          setValidationReason(rejectionReason);
+          if (!bestFallback || score < bestFallback.score) {
+            bestFallback = {
+              item: parsed,
+              sim,
+              jaccard,
+              similarityBreakdown: {
+                passage: passageSim,
+                question: questionSim,
+                correctChoice: correctChoiceSim,
+                distractors: distractorSim,
+                choices: overallChoicesSim,
+              },
+              choiceStructure: resolvedChoiceStructure,
+              score,
+              rejectionReason,
+            };
+          }
+          continue;
+        }
         if (!best || score < best.score) {
           best = {
             item: parsed,
@@ -2192,16 +2294,19 @@ app.post("/generate/mc", async (req, res) => {
             },
             choiceStructure: resolvedChoiceStructure,
             score,
-            similarityWarning: allowHighSimCombo
-              ? "Similarity above max; accepted due to structure match."
-              : undefined,
+            ...(allowHighSimCombo
+              ? { similarityWarning: "Similarity above max; accepted due to structure match." }
+              : {}),
           };
         }
       }
     }
 
     if (best) {
+      stage = "accepted";
       return res.json({
+        ok: true,
+        apiVersion: API_VERSION,
         item: best.item,
         format: "multiple_choice",
         similarity: best.sim,
@@ -2213,17 +2318,81 @@ app.post("/generate/mc", async (req, res) => {
         choiceStructure: best.choiceStructure,
         passageWarning: fixedPassageWarning ?? undefined,
         similarityWarning: best.similarityWarning,
+        runId,
+        sourceId,
+        candidateId: `${runId}:best:0`,
+        debug: { stage },
       });
     }
-
+    if (bestFallback) {
+      stage = "accepted";
+      return res.json({
+        ok: true,
+        apiVersion: API_VERSION,
+        item: bestFallback.item,
+        format: "multiple_choice",
+        similarity: bestFallback.sim,
+        jaccard: bestFallback.jaccard,
+        similarityRange: { min: minSim, max: maxSim, maxJaccard },
+        similarityBreakdown: bestFallback.similarityBreakdown,
+        mode: "A",
+        choiceIntent: choiceIntent ?? undefined,
+        choiceStructure: bestFallback.choiceStructure,
+        passageWarning: fixedPassageWarning ?? undefined,
+        similarityWarning: `Returned fallback candidate outside similarity range. ${bestFallback.rejectionReason}`,
+        runId,
+        sourceId,
+        candidateId: `${runId}:fallback:0`,
+        debug: { stage },
+      });
+    }
+    if (softAccepted) {
+      const combined = normalizeForSimilarity(buildCombinedText(softAccepted.item));
+      const candidateVec = await embeddingProvider.embedText(combined, 8);
+      const sim = cosineSimilarity(sourceVec, candidateVec);
+      const jaccard = tokenJaccard(sourceCombined, combined);
+      stage = "accepted";
+      return res.json({
+        ok: true,
+        apiVersion: API_VERSION,
+        item: softAccepted.item,
+        format: "multiple_choice",
+        similarity: sim,
+        jaccard,
+        similarityRange: { min: minSim, max: maxSim, maxJaccard },
+        similarityBreakdown: {
+          passage: null,
+          question: null,
+          correctChoice: null,
+          distractors: null,
+          choices: null,
+        },
+        mode: "A",
+        choiceIntent: choiceIntent ?? undefined,
+        choiceStructure: null,
+        passageWarning: fixedPassageWarning ?? undefined,
+        similarityWarning: `Soft-accepted candidate (warning): ${softAccepted.reason}`,
+        runId,
+        sourceId,
+        candidateId: `${runId}:soft-accept:0`,
+        debug: { stage },
+      });
+    }
+    stage = llmLastValidationReason ? "validation_failed" : "similarity_rejected";
     return res.status(422).json({
+      ok: false,
+      apiVersion: API_VERSION,
       error:
         llmLastValidationReason === "Passage length out of range."
           ? "Generated passage length did not meet target range. Please try again."
           : "Generated problem too similar to source. Please try again.",
+      errorType: llmLastValidationReason ? "VALIDATION_FAILED" : "SIMILARITY_REJECTED",
+      runId,
+      sourceId,
       similarityRange: { min: minSim, max: maxSim, maxJaccard },
       reason: llmLastValidationReason || null,
       debug: {
+        stage,
         llmAttempted,
         llmLastSim,
         llmLastJaccard,
@@ -2239,19 +2408,34 @@ app.post("/generate/mc", async (req, res) => {
 
 app.post("/target/from-sources-mc", async (req, res) => {
   try {
-    const { sourceTexts } = req.body as { sourceTexts: string[] };
+    const { sourceTexts } = req.body as TargetFromSourcesMcRequest;
     if (!Array.isArray(sourceTexts)) {
-      return res.status(400).json({ error: "Expected { sourceTexts: string[] }" });
+      return res.status(400).json({
+        ok: false,
+        apiVersion: API_VERSION,
+        error: "Expected { sourceTexts: string[] }",
+        errorType: "BAD_REQUEST",
+      });
     }
     if (!generationProvider) {
-      return res.status(400).json({ error: "Generation provider not configured." });
+      return res.status(400).json({
+        ok: false,
+        apiVersion: API_VERSION,
+        error: "Generation provider not configured.",
+        errorType: "BAD_REQUEST",
+      });
     }
     const items = sourceTexts
       .map((s) => s.trim())
       .filter(Boolean)
       .slice(0, 3);
     if (items.length === 0) {
-      return res.status(400).json({ error: "sourceTexts must include at least one item." });
+      return res.status(400).json({
+        ok: false,
+        apiVersion: API_VERSION,
+        error: "sourceTexts must include at least one item.",
+        errorType: "BAD_REQUEST",
+      });
     }
 
     const Ls: number[] = [];
@@ -2296,6 +2480,8 @@ app.post("/target/from-sources-mc", async (req, res) => {
     };
 
     return res.json({
+      ok: true,
+      apiVersion: API_VERSION,
       mean: meanProfile,
       std: stdProfile,
       axisTolerance,
@@ -2319,7 +2505,12 @@ app.post("/target/from-sources-mc", async (req, res) => {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    return res.status(400).json({ error: message });
+    return res.status(400).json({
+      ok: false,
+      apiVersion: API_VERSION,
+      error: message,
+      errorType: "BAD_REQUEST",
+    });
   }
 });
 
@@ -2472,6 +2663,7 @@ function extractJsonArray<T>(text: string): T[] | null {
 function normalizeChoice(choice: string) {
   return choice
     .replace(/^\s*[\d０-９]+[．\.\)\:]\s*/i, "")
+    .replace(/^\s*[\d０-９]+\s+(?=\S)/i, "")
     .replace(/^\s*[A-D][\).:\-]\s*/i, "")
     .replace(/^\s*[A-D]\s+/, "")
     .trim();
@@ -2490,6 +2682,108 @@ function validateMultipleChoice(item: MultipleChoiceItem): string | null {
     item.correctIndex >= item.choices.length
   ) {
     return "Invalid correctIndex.";
+  }
+  return null;
+}
+
+function coerceChoiceCount(item: MultipleChoiceItem, expectedChoiceCount: number): MultipleChoiceItem | null {
+  if (!Array.isArray(item.choices)) return null;
+  if (item.choices.length === expectedChoiceCount) return item;
+  if (item.choices.length < expectedChoiceCount) return null;
+  const correct = item.choices[item.correctIndex];
+  if (!correct) return null;
+  const distractors = item.choices.filter((_c, idx) => idx !== item.correctIndex);
+  const selected = [correct, ...distractors.slice(0, expectedChoiceCount - 1)];
+  const dedup = Array.from(new Set(selected.map((c) => c.trim()))).filter(Boolean);
+  if (dedup.length < expectedChoiceCount) return null;
+  return {
+    ...item,
+    choices: dedup.slice(0, expectedChoiceCount),
+    correctIndex: 0,
+  };
+}
+
+function tokenizeChoiceText(text: string): string[] {
+  return normalizeForSimilarity(text)
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+function ngramSet(tokens: string[], n: number): Set<string> {
+  const out = new Set<string>();
+  if (tokens.length < n) return out;
+  for (let i = 0; i <= tokens.length - n; i += 1) {
+    out.add(tokens.slice(i, i + n).join(" "));
+  }
+  return out;
+}
+
+function choiceShape(choice: string): "sentence" | "phrase" {
+  const wc = countWords(choice);
+  return /[.!?]$/.test(choice.trim()) || wc >= 10 ? "sentence" : "phrase";
+}
+
+function validateMultipleChoiceStrict(
+  item: MultipleChoiceItem,
+  options: { expectedChoiceCount: number; requireInference: boolean; passageText: string }
+): string | null {
+  const baseError = validateMultipleChoice(item);
+  if (baseError) return baseError;
+  if (item.choices.length !== options.expectedChoiceCount) {
+    return `Expected exactly ${options.expectedChoiceCount} choices.`;
+  }
+  const lowered = item.choices.map((c) => normalizeForSimilarity(c));
+  const dedup = new Set(lowered);
+  if (dedup.size !== item.choices.length) {
+    return "Choices must be unique.";
+  }
+  if (
+    lowered.some((c) =>
+      /\b(all of the above|none of the above|both a and b|both b and c)\b/i.test(c)
+    )
+  ) {
+    return "Disallowed meta choice detected.";
+  }
+  const shapes = new Set(item.choices.map(choiceShape));
+  if (shapes.size > 1) {
+    return "Choice type mismatch (sentence vs phrase).";
+  }
+  if (options.requireInference) {
+    const q = item.question.toLowerCase();
+    const hasInferenceCue =
+      /\b(infer|inferred|inference|imply|implied|suggest|most likely|best supported|can be concluded|can be inferred|based on the passage)\b/.test(
+        q
+      ) ||
+      /\bbased on\b/.test(q) ||
+      /\bwhat was unusual\b/.test(q) ||
+      /何を示唆|推測|読み取|最も適切/.test(item.question);
+    if (!hasInferenceCue) {
+      return "Question is not inference-oriented.";
+    }
+  }
+  const passage = options.passageText || "";
+  if (passage.trim().length > 0) {
+    const passageTokens = tokenizeChoiceText(passage);
+    const passageTri = ngramSet(passageTokens, 3);
+    for (const choice of item.choices) {
+      const ct = tokenizeChoiceText(choice);
+      const cTri = ngramSet(ct, 3);
+      if (cTri.size === 0) continue;
+      let overlap = 0;
+      for (const g of cTri) {
+        if (passageTri.has(g)) overlap += 1;
+      }
+      const ratio = overlap / cTri.size;
+      if (ratio > 0.65) return "Choice overlaps passage too directly.";
+    }
+    const correct = item.choices[item.correctIndex] || "";
+    const correctTokens = tokenizeChoiceText(correct).filter((t) => t.length >= 4);
+    const passageSet = new Set(passageTokens);
+    const overlapCount = correctTokens.filter((t) => passageSet.has(t)).length;
+    if (correctTokens.length > 0 && overlapCount === 0) {
+      return "Correct choice lacks passage grounding.";
+    }
   }
   return null;
 }
@@ -2845,6 +3139,7 @@ function splitInlineChoices(line: string): string[] | null {
 
 function getChoiceLabel(line: string): { type: "alpha"; label: string } | { type: "num" } | null {
   if (/^\s*[\d０-９]+[．\.\)]\s+/.test(line)) return { type: "num" };
+  if (/^\s*[\d０-９]+\s+\S+/.test(line)) return { type: "num" };
   const punct = line.match(/^\s*([A-D])[\).:\-]\s+/i);
   if (punct) return { type: "alpha", label: punct[1].toUpperCase() };
   const spaced = line.match(/^\s*([A-D])\s+\S+/i);
@@ -2870,26 +3165,111 @@ function findChoiceBlockStart(lines: string[]): number {
   return idx;
 }
 
+function tryParseLabeledMultipleChoice(sourceText: string): MultipleChoiceItem | null {
+  const lines = sourceText
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length < 4) return null;
+  const passageIdx = lines.findIndex((l) => /^passage\s*:/i.test(l));
+  const questionIdx = lines.findIndex((l) => /^question\s*:/i.test(l));
+  const choicesIdx = lines.findIndex((l) => /^choices\s*:/i.test(l));
+  if (questionIdx < 0 || choicesIdx < 0 || choicesIdx <= questionIdx) return null;
+
+  const answerIdx = lines.findIndex((l) => /^answer\s*:/i.test(l));
+  const contentEnd = answerIdx > choicesIdx ? answerIdx : lines.length;
+
+  const stripLabel = (line: string, label: RegExp) => line.replace(label, "").trim();
+
+  const passageParts: string[] = [];
+  if (passageIdx >= 0 && passageIdx < questionIdx) {
+    const head = stripLabel(lines[passageIdx], /^passage\s*:/i);
+    if (head) passageParts.push(head);
+    for (let i = passageIdx + 1; i < questionIdx; i += 1) {
+      passageParts.push(lines[i]);
+    }
+  }
+
+  const questionParts: string[] = [];
+  const qHead = stripLabel(lines[questionIdx], /^question\s*:/i);
+  if (qHead) questionParts.push(qHead);
+  for (let i = questionIdx + 1; i < choicesIdx; i += 1) {
+    questionParts.push(lines[i]);
+  }
+  const question = questionParts.join(" ").trim();
+  if (!question) return null;
+
+  const choiceTexts: string[] = [];
+  for (let i = choicesIdx + 1; i < contentEnd; i += 1) {
+    const line = lines[i];
+    if (/^answer\s*:/i.test(line)) break;
+    if (getChoiceLabel(line)) {
+      choiceTexts.push(normalizeChoice(line));
+      continue;
+    }
+    if (choiceTexts.length > 0) {
+      choiceTexts[choiceTexts.length - 1] = `${choiceTexts[choiceTexts.length - 1]} ${line}`.trim();
+    }
+  }
+  if (choiceTexts.length < 2) return null;
+
+  let correctIndex = 0;
+  if (answerIdx >= 0) {
+    const answerRaw = stripLabel(lines[answerIdx], /^answer\s*:/i);
+    const alpha = answerRaw.match(/^[A-D]/i)?.[0]?.toUpperCase();
+    if (alpha) {
+      const idx = alpha.charCodeAt(0) - "A".charCodeAt(0);
+      if (idx >= 0 && idx < choiceTexts.length) correctIndex = idx;
+    }
+  }
+
+  const item: MultipleChoiceItem = {
+    passage: passageParts.length > 0 ? passageParts.join(" ") : null,
+    question,
+    choices: choiceTexts,
+    correctIndex,
+    subtype: detectComboChoices(choiceTexts) ? "combo" : "standard",
+  };
+  const error = validateMultipleChoice(item);
+  return error ? null : item;
+}
+
 function tryParseMultipleChoiceHeuristic(sourceText: string): MultipleChoiceItem | null {
+  const labeled = tryParseLabeledMultipleChoice(sourceText);
+  if (labeled) return labeled;
   const rawLines = sourceText
     .split(/\r?\n/)
     .map((l) => l.trim())
     .filter(Boolean);
   if (rawLines.length < 3) return null;
+  const lines: string[] = [];
+  for (const line of rawLines) {
+    const hasLabel = getChoiceLabel(line) !== null;
+    if (hasLabel) {
+      lines.push(line);
+      continue;
+    }
+    const prev = lines[lines.length - 1];
+    if (prev && getChoiceLabel(prev) !== null) {
+      lines[lines.length - 1] = `${prev} ${line}`.trim();
+    } else {
+      lines.push(line);
+    }
+  }
 
-  const inlineChoices = rawLines
+  const inlineChoices = lines
     .map((line) => splitInlineChoices(line))
     .find((choices) => choices && choices.length >= 2);
   if (inlineChoices) {
-    const idx = rawLines.findIndex((l) => splitInlineChoices(l));
-    let questionLine = rawLines[idx - 1];
+    const idx = lines.findIndex((l) => splitInlineChoices(l));
+    let questionLine = lines[idx - 1];
     if (!questionLine) return null;
     const looksLikeStatement = /^[ア-エ]．/.test(questionLine);
-    const firstLine = rawLines[0] || "";
-    let passageLines = rawLines.slice(0, Math.max(0, idx - 1));
+    const firstLine = lines[0] || "";
+    let passageLines = lines.slice(0, Math.max(0, idx - 1));
     if (looksLikeStatement && /選びなさい|問|次の記述/.test(firstLine)) {
       questionLine = firstLine;
-      passageLines = rawLines.slice(1, Math.max(1, idx - 1));
+      passageLines = lines.slice(1, Math.max(1, idx - 1));
     }
     const item: MultipleChoiceItem = {
       passage: passageLines.length ? passageLines.join("\n") : null,
@@ -2901,8 +3281,6 @@ function tryParseMultipleChoiceHeuristic(sourceText: string): MultipleChoiceItem
     const error = validateMultipleChoice(item);
     return error ? null : item;
   }
-
-  const lines = [...rawLines];
 
   const answerLineIndex = lines.findIndex((l) => /^answer\s*:/i.test(l));
   let explicitAnswer: string | null = null;

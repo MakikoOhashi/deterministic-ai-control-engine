@@ -15,7 +15,7 @@ export async function computeTargetProfile(
   items: BaselineItem[],
   provider: EmbeddingProvider,
   maxSteps = 5
-): TargetProfile {
+): Promise<TargetProfile> {
   if (items.length === 0) {
     throw new Error("Baseline items are required to compute target profile.");
   }

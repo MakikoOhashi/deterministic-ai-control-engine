@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "concurrently -k -n backend,frontend -c blue,green \"npm --prefix backend run dev\" \"npm --prefix frontend run dev\"",
     "dev:backend": "npm --prefix backend run dev",
-    "dev:frontend": "npm --prefix frontend run dev"
+    "dev:frontend": "npm --prefix frontend run dev",
+    "typecheck:v1": "./backend/node_modules/.bin/tsc --noEmit -p backend/tsconfig.v1.json && ./frontend/node_modules/.bin/tsc --noEmit -p frontend/tsconfig.json"
   },
   "devDependencies": {
     "concurrently": "^9.2.0"

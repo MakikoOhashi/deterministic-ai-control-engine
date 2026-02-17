@@ -2,6 +2,13 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import QualityConsole from "./quality/QualityConsole";
+import type {
+  Components,
+  SimilarityBreakdown,
+  ChoiceStructure,
+  GenerateMcResponse,
+  TargetFromSourcesMcResponse,
+} from "../../shared/api";
 
 type Weights = {
   wL: number;
@@ -10,12 +17,6 @@ type Weights = {
   wR: number;
 };
 
-type Components = {
-  L: number;
-  S: number;
-  A: number;
-  R: number;
-};
 type TargetBand = {
   min: Components;
   max: Components;
@@ -28,22 +29,9 @@ type OverallResponse = {
   weights: Weights;
 };
 
-type SimilarityBreakdown = {
-  passage: number | null;
-  question: number | null;
-  correctChoice: number | null;
-  distractors: number | null;
-  choices: number | null;
-};
 type ChoiceIntent = {
   concept: string;
   patterns: string[];
-};
-type ChoiceStructure = {
-  correctMeanSim: number;
-  distractorMeanSim: number;
-  distractorVariance: number;
-  isolationIndex: number;
 };
 
 type TaskType = "guided_reading";
@@ -127,14 +115,19 @@ export default function Home() {
   const [axisTolerance, setAxisTolerance] = useState<AxisTolerance | null>(null);
   const [targetStability, setTargetStability] = useState<string | null>(null);
   const [effectiveTolerance, setEffectiveTolerance] = useState<number>(0.05);
+  const [inferenceStyle, setInferenceStyle] = useState<
+    "fact_based" | "intent_based" | "emotional"
+  >("fact_based");
+  const [targetAdjust, setTargetAdjust] = useState<Components>({
+    L: 0,
+    S: 0,
+    A: 0,
+    R: 0,
+  });
   const [result, setResult] = useState<OverallResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
-  const [ocrFile, setOcrFile] = useState<File | null>(null);
-  const [ocrPreviewUrl, setOcrPreviewUrl] = useState<string | null>(null);
-  const [ocrLang, setOcrLang] = useState<"eng" | "jpn+eng">("eng");
-  const [ocrLoading, setOcrLoading] = useState(false);
   const [structuring, setStructuring] = useState(false);
   const [sourceAnswerKey, setSourceAnswerKey] = useState<string[]>([]);
   const [sourceSlotCount, setSourceSlotCount] = useState<number>(1);
@@ -185,94 +178,11 @@ export default function Home() {
       .catch(() => setWeights(null));
   }, [apiBase]);
 
-  useEffect(() => {
-    if (!ocrFile) {
-      setOcrPreviewUrl(null);
-      return;
-    }
-    const next = URL.createObjectURL(ocrFile);
-    setOcrPreviewUrl(next);
-    return () => URL.revokeObjectURL(next);
-  }, [ocrFile]);
-
-  const normalizeOcrText = (raw: string) =>
-    raw
-      .replace(/\r/g, "")
-      .replace(/[ \t]+/g, " ")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
-
-  const fileToResizedBase64 = async (file: File, maxSide = 1024) => {
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result || ""));
-      reader.onerror = () => reject(new Error("Failed to read image."));
-      reader.readAsDataURL(file);
-    });
-    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const image = new Image();
-      image.onload = () => resolve(image);
-      image.onerror = () => reject(new Error("Failed to decode image."));
-      image.src = dataUrl;
-    });
-    const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
-    const width = Math.max(1, Math.round(img.width * scale));
-    const height = Math.max(1, Math.round(img.height * scale));
-    const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) throw new Error("Failed to create canvas context.");
-    ctx.drawImage(img, 0, 0, width, height);
-    const output = canvas.toDataURL("image/jpeg", 0.85);
-    const base64 = output.split(",")[1] || "";
-    return { base64, mimeType: "image/jpeg" };
-  };
-
   const runInternalPreprocess = async (): Promise<string | null> => {
     let input = baselineSources.trim();
-    if (!input && !ocrFile) {
-      setError("Paste an example or upload an image first.");
+    if (!input) {
+      setError("Paste an example first.");
       return null;
-    }
-
-    let visionSlots:
-      | Array<{ prefix?: string; missingCount?: number; confidence?: number }>
-      | undefined;
-
-    if (ocrFile) {
-      setOcrLoading(true);
-      try {
-        try {
-          const resized = await fileToResizedBase64(ocrFile, 1024);
-          const visionRes = await fetch(`${apiBase}/vision/extract-slots`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              imageBase64: resized.base64,
-              mimeType: resized.mimeType,
-              maxSlots: 6,
-            }),
-          });
-          if (visionRes.ok) {
-            const v = (await visionRes.json()) as {
-              slots?: Array<{ prefix?: string; missingCount?: number; confidence?: number }>;
-            };
-            if (Array.isArray(v.slots) && v.slots.length > 0) {
-              visionSlots = v.slots;
-            }
-          }
-        } catch {
-          // Vision extraction is best-effort in v1.
-        }
-        const tesseract = await import("tesseract.js");
-        const result = await tesseract.recognize(ocrFile, ocrLang);
-        const normalized = normalizeOcrText(result.data.text || "");
-        if (!normalized) throw new Error("OCR returned empty text.");
-        input = normalized;
-      } finally {
-        setOcrLoading(false);
-      }
     }
 
     setStructuring(true);
@@ -283,7 +193,6 @@ export default function Home() {
         body: JSON.stringify({
           text: input,
           preferredTaskType: taskType,
-          visionSlots,
         }),
       });
       if (!res.ok) {
@@ -329,6 +238,17 @@ export default function Home() {
     }
   };
 
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  const adjustedTarget = useMemo(() => {
+    if (!target) return null;
+    return {
+      L: clamp01(target.L + targetAdjust.L),
+      S: clamp01(target.S + targetAdjust.S),
+      A: clamp01(target.A + targetAdjust.A),
+      R: clamp01(target.R + targetAdjust.R),
+    };
+  }, [target, targetAdjust]);
+
   const handleSetTarget = async (sourceOverride?: string | null) => {
     setLoading(true);
     setError(null);
@@ -338,24 +258,17 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          sourceTexts: (sourceOverride || baselineSources)
-            .split(/\n\s*\n/)
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .slice(0, 3),
+          sourceTexts: [(sourceOverride || baselineSources).trim()].filter(Boolean),
         }),
       });
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error || "Request failed");
       }
-      const data = (await res.json()) as {
-        mean: Components;
-        stability: string;
-        effectiveTolerance: number;
-        axisTolerance?: AxisTolerance;
-        targetBand?: TargetBand;
-      };
+      const data = (await res.json()) as TargetFromSourcesMcResponse;
+      if (!data.ok) {
+        throw new Error(data.error || "Target build failed");
+      }
       setTarget(data.mean);
       setTargetBand(data.targetBand ?? null);
       setAxisTolerance(data.axisTolerance ?? null);
@@ -388,39 +301,24 @@ export default function Home() {
     setError(null);
     try {
       const sourceText =
-        (sourceOverride || baselineSources)
-          .split(/\n\s*\n/)
-          .map((s) => s.trim())
-          .filter(Boolean)[0] || "";
+        (sourceOverride || baselineSources).trim();
       const res = await fetch(`${apiBase}/generate/mc`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           sourceText,
-          target: targetOverride ?? target,
+          target: targetOverride ?? adjustedTarget ?? target,
+          inferenceStyle,
         }),
       });
       if (!res.ok) {
         const err = await res.json();
         throw new Error(err.error || "Request failed");
       }
-      const data = (await res.json()) as {
-        item:
-          | { passage?: string | null; question: string; choices: string[]; correctIndex: number }
-          | { text: string; correct: string; distractors: string[] };
-        displayText?: string;
-        answerKey?: string[];
-        slots?: BlankSlot[];
-        similarity?: number;
-        similarityWarning?: string;
-        similarityBreakdown?: SimilarityBreakdown;
-        choiceIntent?: ChoiceIntent;
-        choiceStructure?: ChoiceStructure;
-        runId?: string;
-        sourceId?: string;
-        candidateId?: string;
-        debug?: { stage?: string };
-      };
+      const data = (await res.json()) as GenerateMcResponse;
+      if (!data.ok) {
+        throw new Error(data.error || "Generation failed");
+      }
       const item = data.item as {
         passage?: string | null;
         question: string;
@@ -473,6 +371,16 @@ export default function Home() {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
     }
+  };
+
+  const handleRegenerate = async () => {
+    setError(null);
+    setWarning(null);
+    if (!target && !adjustedTarget) {
+      setError("Set target first.");
+      return;
+    }
+    await handleGenerate(adjustedTarget ?? target, baselineSources);
   };
 
   const handleAudit = async () => {
@@ -555,39 +463,53 @@ export default function Home() {
           />
         </div>
         <div className="field">
-          <label>Or upload screenshot (OCR)</label>
-          <input
-            type="file"
-            accept="image/*"
-            onChange={(e) => setOcrFile(e.target.files?.[0] || null)}
-          />
-          <div className="actions" style={{ marginTop: 8 }}>
-            <select
-              value={ocrLang}
-              onChange={(e) => setOcrLang(e.target.value as "eng" | "jpn+eng")}
-              style={{ maxWidth: 240 }}
-            >
-              <option value="eng">English OCR</option>
-              <option value="jpn+eng">Japanese + English OCR</option>
-            </select>
-            <span className="muted">
-              OCR + AI structuring runs automatically when you click Set Target + Generate.
-            </span>
+          <label>Inference Style</label>
+          <select
+            value={inferenceStyle}
+            onChange={(e) =>
+              setInferenceStyle(
+                e.target.value as "fact_based" | "intent_based" | "emotional"
+              )
+            }
+            style={{ maxWidth: 280 }}
+          >
+            <option value="fact_based">Fact-based</option>
+            <option value="intent_based">Intent-based</option>
+            <option value="emotional">Emotional/Tone</option>
+          </select>
+        </div>
+
+        <div className="field">
+          <label>Difficulty Target Adjust (L / S / A / R)</label>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}>
+            {(["L", "S", "A", "R"] as const).map((axis) => (
+              <div key={axis} style={{ display: "grid", gridTemplateColumns: "28px 1fr 56px", gap: 8, alignItems: "center" }}>
+                <span>{axis}</span>
+                <input
+                  type="range"
+                  min={-0.2}
+                  max={0.2}
+                  step={0.01}
+                  value={targetAdjust[axis]}
+                  onChange={(e) =>
+                    setTargetAdjust((prev) => ({
+                      ...prev,
+                      [axis]: Number(e.target.value),
+                    }))
+                  }
+                />
+                <span>{targetAdjust[axis].toFixed(2)}</span>
+              </div>
+            ))}
           </div>
-          {ocrPreviewUrl ? (
-            <div style={{ marginTop: 8 }}>
-              <img
-                src={ocrPreviewUrl}
-                alt="OCR source preview"
-                style={{ maxWidth: "100%", maxHeight: 220, borderRadius: 8, border: "1px solid #e2e8f0" }}
-              />
-            </div>
-          ) : null}
         </div>
 
         <div className="actions" style={{ marginTop: 4 }}>
           <button onClick={handleSetAndGenerate} disabled={loading}>
-            {loading || ocrLoading || structuring ? "Working..." : "Set Target + Generate"}
+            {loading || structuring ? "Working..." : "Set Target + Generate"}
+          </button>
+          <button onClick={handleRegenerate} disabled={loading || !target}>
+            {loading ? "Working..." : "Regenerate"}
           </button>
         </div>
 
