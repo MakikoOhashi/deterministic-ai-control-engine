@@ -142,6 +142,7 @@ export default function Home() {
     candidateId?: string;
     stage?: string;
   } | null>(null);
+  const [lastTargetSource, setLastTargetSource] = useState<string | null>(null);
   const parsedBlank = useMemo(() => parsePrimaryBlank(question), [question]);
   const sortedContextSlots = useMemo(
     () => [...contextSlots].sort((a, b) => a.start - b.start),
@@ -270,6 +271,7 @@ export default function Home() {
         throw new Error(data.error || "Target build failed");
       }
       setTarget(data.mean);
+      setLastTargetSource((sourceOverride || baselineSources).trim());
       setTargetBand(data.targetBand ?? null);
       setAxisTolerance(data.axisTolerance ?? null);
       setTargetStability(data.stability);
@@ -364,9 +366,15 @@ export default function Home() {
     try {
       const normalizedSource = await runInternalPreprocess();
       if (!normalizedSource) return;
-      const nextTarget = await handleSetTarget(normalizedSource);
-      if (!nextTarget) return;
-      await handleGenerate(nextTarget, normalizedSource);
+      const normalizedKey = normalizedSource.trim();
+      const needsTargetRecalc = !target || !lastTargetSource || lastTargetSource !== normalizedKey;
+      if (needsTargetRecalc) {
+        const nextTarget = await handleSetTarget(normalizedSource);
+        if (!nextTarget) return;
+        await handleGenerate(nextTarget, normalizedSource);
+        return;
+      }
+      await handleGenerate(adjustedTarget ?? target, normalizedSource);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
       setError(message);
@@ -506,7 +514,7 @@ export default function Home() {
 
         <div className="actions" style={{ marginTop: 4 }}>
           <button onClick={handleSetAndGenerate} disabled={loading}>
-            {loading || structuring ? "Working..." : "Set Target + Generate"}
+            {loading || structuring ? "Working..." : "Generate"}
           </button>
           <button onClick={handleRegenerate} disabled={loading || !target}>
             {loading ? "Working..." : "Regenerate"}
