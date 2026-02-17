@@ -1,186 +1,192 @@
 # Difficulty Evaluation-Guided Generation Engine
 
-## 概要
-本プロジェクトは、英語学習向け問題を **LLM生成 + 評価関数** で安定化する実験実装です。  
-主眼は「問題生成」そのものではなく、**生成物の採否を評価で決めること**です。
+## Overview
+This project is a **Guided Reading item generation engine** for English learning.
+The goal is not raw content generation; it is **evaluation-driven control**:
 
-- 固有試験ブランドには依存しない
-- 画像入力（OCR/Vision）とテキスト入力の両方を扱う
-- 難易度を L/S/A/R/D で定量化
-- 類似度・形式・再利用語チェックで不適切生成を reject
+- Generate `Passage + Inference Question + 4 choices`
+- Measure difficulty with `L / S / A / R / D`
+- Enforce format and similarity guards
+- Expose run metadata (`stage`, `runId`, `sourceId`) for auditability
+
+v1 is intentionally narrowed to one flow so it can be demonstrated reliably.
 
 ---
 
-## Local Dev（1コマンド起動）
+## v1 Scope
+
+### Included
+- Guided Reading (single item)
+- Mode A only (topic can change)
+- Text input only (paste one example item)
+- Generate / Regenerate workflow
+- Inference style selector (`fact_based` / `intent_based` / `emotional`)
+
+### Out of scope (v2+)
+- Context Completion (fill-blank)
+- Mode B (concept preservation)
+- OCR / image upload path in UI
+
+---
+
+## Local Dev
 
 ```bash
 npm install
 npm run dev
 ```
 
-- backend: `tsx watch` で自動リロード
-- frontend: `next dev` で自動リロード
-- ポート固定（デフォルト）:
-  - frontend: `3000`
-  - backend: `3001`（`PORT` で変更可）
+- Frontend: `http://localhost:3000`
+- Backend: `http://localhost:3001`
 
-### v1 Typecheck（提出範囲のみ）
+### v1 Typecheck
 
 ```bash
 npm run typecheck:v1
 ```
 
-- backend: `tsconfig.v1.json`（v1経路を対象）
-- frontend: `tsc --noEmit`
+This checks only submission-critical paths.
 
 ---
 
-## 現在の対応タスク
-- `Guided Reading`（Passage + Inference Question + 4 Choices）
+## UI Semantics
 
-> v1は `Mode A (Free Domain)` を主軸にした **TOEFL-like 読解形式** に固定。
-> `Context Completion` と `Mode B` は将来拡張。
+The top controls are:
 
----
+- `Generate`
+  - Runs preprocessing + target build when needed
+  - If source text changed (or target missing), target is recalculated automatically
+  - Then generates one MC item
+- `Regenerate`
+  - Reuses the current target and regenerates a new candidate
 
-## コア設計
+This keeps first-run setup automatic while enabling rapid exploration.
 
-### Evaluation-first
-LLMは候補生成器。最終採用は評価側で決定。
+Input expectation (recommended):
 
-1. 生成（Generate）
-2. 検証（Format / Similarity / Difficulty / Reuse）
-3. 採用 or Reject
+```text
+Passage:
+...
 
-### payload / debug 分離
-`/ocr/structure` は以下を分離して返します。
+Question:
+...
 
-- `payload`: 生成に必要な最小情報（本番利用）
-- `debug`: 生OCR/整形結果などの観測情報（監査・開発用）
+Choices:
+A) ...
+B) ...
+C) ...
+D) ...
 
-これにより「どの中間表現を正とするか」の混乱を避けます。
+Answer: B
+```
 
-### API Contract（single source）
-
-- 共通契約は `/Users/makiko/Documents/Documents - makiko’s MacBook Air/dev/deterministic-ai-control-engine/shared/api.ts`
-- v1で共通化済み:
-  - `POST /generate/mc`
-  - `POST /target/from-sources-mc`
-- 返却は discriminated union:
-  - success: `{ ok: true, apiVersion: "v1", ... }`
-  - error: `{ ok: false, apiVersion: "v1", errorType, ... }`
+Parser also accepts numeric choices like `1 ... 2 ... 3 ... 4 ...`.
 
 ---
 
-## Pipeline（現行）
+## Contract-First API
+
+Single source of truth:
+- `/Users/makiko/Documents/Documents - makiko’s MacBook Air/dev/deterministic-ai-control-engine/shared/api.ts`
+
+Common contract is applied to:
+- `POST /target/from-sources-mc`
+- `POST /generate/mc`
+
+Responses are discriminated unions:
+- success: `{ ok: true, apiVersion: "v1", ... }`
+- error: `{ ok: false, apiVersion: "v1", errorType, ... }`
+
+---
+
+## Pipeline (Current)
 
 ```mermaid
 flowchart TD
-  A["User Upload or Paste"] --> B["OCR + Vision"]
-  B --> C["ocr_structure"]
-  C --> C1["payload"]
-  C --> C2["debug"]
-  C1 --> D["target_from_sources"]
-  D --> E["target mean + targetBand + axisTolerance"]
-  E --> F["generate_mc"]
-  F --> G["Format Validation"]
-  G --> H["Similarity + Difficulty Distance + Reuse Check"]
-  H -->|pass| I["Return Generated Item"]
-  H -->|fail| J["Repair or Reject"]
+  A["Paste one example item"] --> B["POST /ocr/structure (text structuring)"]
+  B --> C["POST /target/from-sources-mc"]
+  C --> D["Target mean + targetBand + axisTolerance"]
+  D --> E["POST /generate/mc"]
+  E --> F["Static validation + similarity + difficulty checks"]
+  F -->|accepted| G["Return item + metrics + trace"]
+  F -->|soft-accepted| H["Return item + similarityWarning"]
+  F -->|hard-fail| I["VALIDATION_FAILED / SIMILARITY_REJECTED"]
 ```
 
 ---
 
-## Execution Spec（Upload/Paste → Generation）
+## Core Endpoints
 
-### 1. User Input
-- `ocrFile`（画像）または `baselineSources`（テキスト）
-- `taskType` は v1で `guided_reading` 固定
+## 1) Build target
+`POST /target/from-sources-mc`
 
-### 2. Frontend Image Preprocess
-- 関数: `fileToResizedBase64(file, 1024)`
-- 目的: 長辺 1024px に縮小して推論コストを削減
-- API: `POST /vision/extract-slots`（best-effort）
-- 使用項目: OCR補助（主生成はMCパース）
-
-### 3. OCR
-- 関数: `tesseract.recognize(...)`
-- 正規化: `normalizeOcrText(...)`
-- 結果テキストを次段の `/ocr/structure` へ渡す
-
-### 4. Structure Build（`POST /ocr/structure`）
-
-入力:
-- `text`
-- `preferredTaskType`
-- `visionSlots`（任意）
-
-内部処理（backend）:
-- `parseMultipleChoice`（passage/question/choices/answer抽出）
-- `classifyFormat`
-- 必要時: heuristic parse fallback
-
-出力は `payload` / `debug` を分離:
-
+Request:
 ```json
 {
-  "payload": {
-    "taskType": "guided_reading",
-    "displayText": "Passage: ...",
-    "textFeatures": {
-      "wordCount": 136,
-      "textLengthBucket": "medium",
-      "cefr": "C1",
-      "lexical": 0.34,
-      "structural": 0.29
-    }
-  },
-  "debug": {
-    "rawOcrText": "...",
-    "normalizedText": "..."
-  }
+  "sourceTexts": ["Passage: ... Question: ... Choices: ..."]
 }
 ```
 
-Frontendで使うのは原則 `payload`:
-- `payload.displayText` → 生成入力の基準テキスト
-- `payload.sourceAnswerKey` → 再利用禁止用 `sourceAnswers`
-
-### 5. Target Build（`POST /target/from-sources-mc`）
-
-入力:
-- `sourceTexts[]`
-
-出力:
-- `mean`, `std`
-- `axisTolerance`
-- `targetBand`（`min/max`）
-- `effectiveTolerance`
-- `stability`
-
-`count=1` のときは点ではなく帯（range）重視で判定。
-
-### 6. Generation（`POST /generate/fill-blank`）
-
-入力:
-- `sourceText`
-- `target`（`L/S/A/R`）
-- `sourceAnswers`（`sourceAnswerKey`）
-
-内部処理:
-- Step A: 空欄なし全文を生成（LLM）
-- Step B: 空欄化語を選定（LLM, JSON）
-- Step C: `buildBlankedCandidateFromFullText` で決定論的に空欄化
-- Step D: 評価（format / similarity / jaccard / difficulty distance / reuse）
-
-返却（成功時）:
-
+Success:
 ```json
 {
-  "item": { "text": "... fa__ ...", "correct": "fame" },
-  "answers": ["fame"],
-  "similarity": 0.72,
-  "jaccard": 0.22,
+  "ok": true,
+  "apiVersion": "v1",
+  "mean": { "L": 0.3, "S": 0.4, "A": 0.7, "R": 0.4 },
+  "std": { "L": 0.0, "S": 0.0, "A": 0.0, "R": 0.0 },
+  "axisTolerance": { "L": 0.12, "S": 0.12, "A": 0.12, "R": 0.12 },
+  "targetBand": {
+    "min": { "L": 0.18, "S": 0.28, "A": 0.58, "R": 0.28 },
+    "max": { "L": 0.42, "S": 0.52, "A": 0.82, "R": 0.52 }
+  },
+  "count": 1,
+  "stability": "Low",
+  "effectiveTolerance": 0.12
+}
+```
+
+## 2) Generate item
+`POST /generate/mc`
+
+Request:
+```json
+{
+  "sourceText": "Passage: ...",
+  "target": { "L": 0.3, "S": 0.4, "A": 0.7, "R": 0.4 },
+  "mode": "A",
+  "inferenceStyle": "fact_based"
+}
+```
+
+Success:
+```json
+{
+  "ok": true,
+  "apiVersion": "v1",
+  "item": {
+    "passage": "...",
+    "question": "...",
+    "choices": ["...", "...", "...", "..."],
+    "correctIndex": 1
+  },
+  "format": "multiple_choice",
+  "similarity": 0.53,
+  "jaccard": 0.23,
+  "similarityRange": { "min": 0.4, "max": 0.85, "maxJaccard": 0.75 },
+  "similarityBreakdown": {
+    "passage": 0.49,
+    "question": 0.53,
+    "correctChoice": 0.58,
+    "distractors": 0.56,
+    "choices": 0.57
+  },
+  "mode": "A",
+  "choiceStructure": {
+    "correctMeanSim": 0.60,
+    "distractorMeanSim": 0.69,
+    "distractorVariance": 0.01,
+    "isolationIndex": -0.09
+  },
   "runId": "...",
   "sourceId": "...",
   "candidateId": "...",
@@ -188,194 +194,95 @@ Frontendで使うのは原則 `payload`:
 }
 ```
 
-失敗時:
-- `errorType`: `VALIDATION_FAILED` / `SIMILARITY_REJECTED` / `NO_CANDIDATE`
-- `debug.stage`, `debug.llmLastValidationReason` で失敗段階を追跡
-
-### 7. Audit（`POST /difficulty/overall`）
-- 生成問題に対して `L/S/A/R/D` を再計測
-- UIの `Difficulty Stability Console` に表示
-
-### 8. Responsibility Split
-
-AI利用:
-- `/vision/extract-slots`
-- `/ocr/structure` のOCR補正
-- `/generate/fill-blank` の Step A / Step B
-
-決定論（関数）:
-- 正規化・抽出: `normalizePrefixUnderscorePatterns`, `extractBlankSlots`
-- 空欄化: `buildBlankedCandidateFromFullText`
-- 検証: `validateGenerated`
-- 評価: similarity / jaccard / difficulty
-- 再利用語reject: `sourceAnswers` 正規化比較
-
----
-
-## Context Completion フロー（詳細）
-
-### Step A
-空欄なしの全文を生成（LLM）
-
-### Step B
-その全文から空欄にする語を選定（LLM, JSON）
-
-### Step C
-空欄化はコード側で決定論的に実施
-
-- prefixあり/なしを保持
-- blank長は実語長から算出
-
-### Step D
-評価関数で採否判定
-
-- format
-- similarity / jaccard
-- difficulty distance
-- source answer reuse
-
----
-
-## Difficulty モデル
-
-### 軸
-- `L`: Lexical Complexity
-- `S`: Structural Complexity
-- `A`: Semantic Ambiguity
-- `R`: Reasoning Depth
-
-### 統合
-`D = 0.20L + 0.20S + 0.30A + 0.30R`
-
-### Target の扱い
-`/target/from-sources` は以下を返却:
-
-- `mean`
-- `std`
-- `axisTolerance`
-- `targetBand(min/max)`
-- `effectiveTolerance`
-- `stability`
-
-`count=1` の場合は点推定ではなく **帯（range）重視** で判定します。
-
----
-
-## 主な API
-
-### 入力解析
-- `POST /ocr/extract` 画像OCR
-- `POST /vision/extract-slots` 画像から slot 構造抽出
-- `POST /ocr/structure` payload/debug 分離構造化
-
-### ターゲット計算
-- `POST /target/from-sources`（Context Completion）
-- `POST /target/from-sources-mc`（Guided Reading）
-
-### 生成
-- `POST /generate/fill-blank`
-- `POST /generate/mc`
-
-### 評価
-- `POST /difficulty/overall`
-- `GET /difficulty/weights`
-
----
-
-## 主要レスポンス例
-
-### `/ocr/structure`（抜粋）
+Error:
 ```json
 {
-  "payload": {
-    "taskType": "context_completion",
-    "format": "prefix_blank",
-    "displayText": "... fa__ ...",
-    "sourceAnswerKey": ["fail"],
-    "slotCount": 1,
-    "slots": [{ "prefix": "fa", "missingCount": 2, "slotConfidence": 0.82 }],
-    "textFeatures": { "wordCount": 48, "textLengthBucket": "short", "cefr": "B2", "lexical": 0.31, "structural": 0.28 }
-  },
-  "debug": {
-    "rawOcrText": "...",
-    "aiNormalizedText": "...",
-    "normalizedText": "..."
-  }
-}
-```
-
-### `/generate/fill-blank`（抜粋）
-```json
-{
-  "item": { "text": "... fa__ ...", "correct": "fame" },
-  "answers": ["fame"],
-  "similarity": 0.72,
-  "jaccard": 0.22,
-  "runId": "...",
-  "sourceId": "...",
-  "candidateId": "...",
-  "debug": { "stage": "accepted" }
-}
-```
-
-失敗時は:
-
-```json
-{
+  "ok": false,
+  "apiVersion": "v1",
+  "error": "Generated problem too similar to source. Please try again.",
   "errorType": "VALIDATION_FAILED",
+  "reason": "Question is not inference-oriented.",
+  "runId": "...",
+  "sourceId": "...",
   "debug": {
     "stage": "validation_failed",
-    "llmLastValidationReason": "Expected exactly 1 blank."
+    "llmLastValidationReason": "Question is not inference-oriented."
   }
 }
 ```
 
 ---
 
-## フロント実装方針（現行）
+## Validation and Acceptance Strategy (v1)
 
-- 上段: 学習者向け操作（入力・生成・回答）
-- 下段: `Difficulty Stability Console`（監査）
+Hard requirements:
+- MC format is valid
+- Exactly 4 choices
+- Exactly 1 correct answer
+- Question does not embed choices
+- Choice-level hygiene (duplicates / meta-choice bans)
 
-Console では以下を表示:
-- Compliance
-- Target D / Current D / Distance
-- Target Range（L/S/A/R）
-- Axis Table
-- Similarity（必要時）
-- `debug.stage`, `runId`, `sourceId`
+Quality checks:
+- Inference-oriented question style
+- Similarity window and lexical overlap controls
+- Difficulty distance against target profile
 
----
+Repair behavior:
+- If model returns more than 4 choices, engine trims to 4 while preserving the correct option.
+- If strict checks fail but base MC structure is usable, engine may soft-accept and return `similarityWarning`.
 
-## 制約（v1）
+To keep UX smooth, v1 also allows **soft-accept** in constrained cases:
+- returns success with `similarityWarning`
+- keeps stage trace for auditability
 
-- OCR品質が極端に低い画像では slot抽出が不安定
-- `Context Completion` は現在 1〜2 blanks を優先
-- `Mode B` は未実装（READMEの将来計画）
+`errorType` values in v1:
+- `BAD_REQUEST`
+- `VALIDATION_FAILED`
+- `SIMILARITY_REJECTED`
 
----
-
-## 技術スタック
-
-### Backend
-- Node.js / TypeScript / Express
-- Embedding Provider（Dummy / Gemini）
-- Gemini Text Generation Provider
-
-### Frontend
-- Next.js 14
-- React + useState（軽量構成）
-
-### Infra（想定）
-- DigitalOcean App Platform
-- Managed DB / Vector拡張（将来）
+`debug.stage` values:
+- `source_received`
+- `source_parsed`
+- `passage_generated`
+- `candidate_generated`
+- `validation_failed`
+- `similarity_rejected`
+- `accepted`
 
 ---
 
-## 目的の再定義
+## Difficulty Model
 
-本プロジェクトは「教育アプリUI」よりも、
+Axes:
+- `L`: lexical complexity
+- `S`: structural complexity
+- `A`: semantic ambiguity (correct vs distractors)
+- `R`: reasoning depth
 
-**Evaluation-Guided Generation（評価設計駆動の生成制御）**
+Composite score:
+- `D = 0.20L + 0.20S + 0.30A + 0.30R`
 
-を実証するためのエンジンです。
+For `count=1`, range-based interpretation (`targetBand`) is prioritized over point precision.
+
+---
+
+## Notes
+
+- `GET /favicon.ico 404` from frontend dev server is non-blocking.
+- If frontend shows `ERR_CONNECTION_REFUSED` for `:3001`, backend is not running.
+- If you see `Failed to parse multiple-choice input`, ensure one full item is pasted (passage + one question + one 4-choice set).
+
+---
+
+## Tech Stack
+
+- Backend: Node.js, TypeScript, Express
+- Frontend: Next.js 14, React
+- Providers: Gemini generation/embedding (or dummy embeddings for local fallback)
+
+---
+
+## Project Positioning
+
+This repository demonstrates an **evaluation-controlled generation engine**,
+not a full consumer test-prep app.

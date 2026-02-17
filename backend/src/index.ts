@@ -170,7 +170,12 @@ app.post("/difficulty/semantic-ambiguity/text", async (req, res) => {
     return res.json({ A: score });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";
-    return res.status(400).json({ error: message });
+    return res.status(400).json({
+      ok: false,
+      apiVersion: API_VERSION,
+      error: message,
+      errorType: "BAD_REQUEST",
+    });
   }
 });
 
