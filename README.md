@@ -49,6 +49,34 @@ This checks only submission-critical paths.
 
 ---
 
+## DigitalOcean App Platform (Backend)
+
+Set **Source directory** to:
+
+```text
+backend
+```
+
+Use:
+
+- Build command
+
+```bash
+npm install && npm run build
+```
+
+- Run command
+
+```bash
+npm start
+```
+
+Backend production scripts:
+- `npm run build` → `tsc -p tsconfig.v1.json`
+- `npm start` → `node dist/backend/src/index.js`
+
+---
+
 ## UI Semantics
 
 The top controls are:
