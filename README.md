@@ -62,7 +62,7 @@ Use:
 - Build command
 
 ```bash
-npm install && npm run build
+npm ci && npm run build
 ```
 
 - Run command
@@ -74,6 +74,55 @@ npm start
 Backend production scripts:
 - `npm run build` → `tsc -p tsconfig.v1.json`
 - `npm start` → `node dist/backend/src/index.js`
+
+Health check:
+
+```text
+GET /health
+```
+
+---
+
+## DigitalOcean App Platform (Frontend Static Site)
+
+Set **Source directory** to:
+
+```text
+frontend
+```
+
+Use:
+
+- Build command
+
+```bash
+npm ci && npm run build
+```
+
+- Output directory
+
+```text
+out
+```
+
+Required env var (build-time):
+
+```text
+NEXT_PUBLIC_API_BASE=<backend public base URL>
+```
+
+If backend is mounted under an app path prefix, include it in `NEXT_PUBLIC_API_BASE`.
+Example:
+
+```text
+NEXT_PUBLIC_API_BASE=https://deterministic-ai-control-engine-dkcf4.ondigitalocean.app/deterministic-ai-control-engine
+```
+
+Current frontend URL example:
+
+```text
+https://deterministic-ai-control-engine-dkcf4.ondigitalocean.app/
+```
 
 ---
 
@@ -116,7 +165,7 @@ Parser also accepts numeric choices like `1 ... 2 ... 3 ... 4 ...`.
 ## Contract-First API
 
 Single source of truth:
-- `/Users/makiko/Documents/Documents - makiko’s MacBook Air/dev/deterministic-ai-control-engine/shared/api.ts`
+- `shared/api.ts`
 
 Common contract is applied to:
 - `POST /target/from-sources-mc`
@@ -300,6 +349,8 @@ For `count=1`, range-based interpretation (`targetBand`) is prioritized over poi
 - `GET /favicon.ico 404` from frontend dev server is non-blocking.
 - If frontend shows `ERR_CONNECTION_REFUSED` for `:3001`, backend is not running.
 - If you see `Failed to parse multiple-choice input`, ensure one full item is pasted (passage + one question + one 4-choice set).
+- If `GET /difficulty/weights` returns `404` in production, `NEXT_PUBLIC_API_BASE` is likely pointing to the wrong base path (missing backend prefix).
+- `NEXT_PUBLIC_API_BASE` is embedded at build time for static export; changing it requires redeploy.
 
 ---
 
