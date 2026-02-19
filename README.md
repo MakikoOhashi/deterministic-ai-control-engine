@@ -13,6 +13,19 @@ v1 is intentionally narrowed to one flow so it can be demonstrated reliably.
 
 ---
 
+## What this project demonstrates
+
+This is not a “just generate questions” app.
+It demonstrates a deterministic control pattern over probabilistic generation:
+
+> Generation is probabilistic.  
+> Acceptance should not be.
+
+Engine decisions are made through measurable metrics and explicit thresholds, with
+traceable run metadata (`runId`, `sourceId`, `candidateId`, `debug.stage`).
+
+---
+
 ## v1 Scope
 
 ### Included
@@ -26,6 +39,12 @@ v1 is intentionally narrowed to one flow so it can be demonstrated reliably.
 - Context Completion (fill-blank)
 - Mode B (concept preservation)
 - OCR / image upload path in UI
+
+### Intentionally not in v1
+- OCR / vision extraction pipeline in user flow
+- RAG / knowledge base indexing
+- Product-scale content management
+- UI polish beyond demo needs
 
 ---
 
@@ -132,6 +151,14 @@ Current frontend URL example:
 ```text
 https://deterministic-ai-control-engine-dkcf4.ondigitalocean.app/
 ```
+
+---
+
+## Why DigitalOcean
+
+- Low-friction deploy path for split architecture (Web Service + Static Site)
+- Reproducible AI pipeline with explicit env/config controls
+- Clear operational boundary between generation/evaluation backend and demo frontend
 
 ---
 
@@ -381,3 +408,19 @@ Design note:
 
 This repository demonstrates an **evaluation-controlled generation engine**,
 not a full consumer test-prep app.
+
+---
+
+## Live Demo
+
+- Frontend: `https://deterministic-ai-control-engine-dkcf4.ondigitalocean.app/`
+- Flow: paste one reference item → generate/regenerate → run audit → inspect acceptance trace
+
+---
+
+## Status
+
+- Deployment: complete
+- End-to-end flow: passed
+- Gradient inference: verified (`/v1/models` and `/v1/chat/completions`)
+- Next step: demo recording and submission packaging
