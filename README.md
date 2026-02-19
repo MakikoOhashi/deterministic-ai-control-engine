@@ -82,13 +82,14 @@ Backend production scripts:
 The top controls are:
 
 - `Generate`
-  - Runs preprocessing + target build when needed
+  - Runs lightweight client-side normalization + target build when needed
   - If source text changed (or target missing), target is recalculated automatically
   - Then generates one MC item
 - `Regenerate`
   - Reuses the current target and regenerates a new candidate
 
 This keeps first-run setup automatic while enabling rapid exploration.
+For Guided Reading v1 demo flow, `/ocr/structure` is intentionally not called from the UI.
 
 Input expectation (recommended):
 
@@ -131,7 +132,7 @@ Responses are discriminated unions:
 
 ```mermaid
 flowchart TD
-  A["Paste one example item"] --> B["POST /ocr/structure (text structuring)"]
+  A["Paste one example item"] --> B["Client normalization (trim/newline/spacing)"]
   B --> C["POST /target/from-sources-mc"]
   C --> D["Target mean + targetBand + axisTolerance"]
   D --> E["POST /generate/mc"]

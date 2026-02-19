@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import QualityConsole from "./quality/QualityConsole";
 import type {
   Components,
@@ -34,56 +34,12 @@ type ChoiceIntent = {
   patterns: string[];
 };
 
-type TaskType = "guided_reading";
-
-type ParsedBlank = {
-  prefix: string;
-  missingCount: number;
-  start: number;
-  end: number;
-} | null;
-
-type BlankSlot = {
-  index: number;
-  start: number;
-  end: number;
-  prefix: string;
-  missingCount: number;
-  pattern: string;
-  slotConfidence?: number;
-};
-
-function parsePrimaryBlank(text: string): ParsedBlank {
-  const prefixMatch = /([A-Za-z]+)\s*((?:[_*]\s*){2,})/.exec(text);
-  if (prefixMatch && prefixMatch.index >= 0) {
-    const rawBlank = prefixMatch[2] || "";
-    const missingCount = rawBlank.replace(/[\s]/g, "").length;
-    return {
-      prefix: prefixMatch[1] || "",
-      missingCount,
-      start: prefixMatch.index,
-      end: prefixMatch.index + prefixMatch[0].length,
-    };
-  }
-
-  const plainMatch = /([_*]\s*){2,}/.exec(text);
-  if (plainMatch && plainMatch.index >= 0) {
-    const missingCount = plainMatch[0].replace(/[\s]/g, "").length;
-    return {
-      prefix: "",
-      missingCount,
-      start: plainMatch.index,
-      end: plainMatch.index + plainMatch[0].length,
-    };
-  }
-
-  return null;
-}
-
-function countBlanksInText(text: string): number {
-  const normalized = String(text || "");
-  const matches = normalized.match(/([A-Za-z]{0,6}\s*(?:[_*]\s*){2,}|(?:[_*]\s*){2,})/g);
-  return matches ? matches.length : 0;
+function normalizeSourceText(input: string): string {
+  return input
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 export default function Home() {
@@ -100,11 +56,6 @@ export default function Home() {
   const [question, setQuestion] = useState("");
   const [choices, setChoices] = useState<string[]>([]);
   const [correctIndex, setCorrectIndex] = useState<number | null>(null);
-  const taskType: TaskType = "guided_reading";
-  const [typedAnswer, setTypedAnswer] = useState("");
-  const [contextSlots, setContextSlots] = useState<BlankSlot[]>([]);
-  const [contextAnswers, setContextAnswers] = useState<string[]>([]);
-  const [contextAnswerKey, setContextAnswerKey] = useState<string[]>([]);
   const [correctText, setCorrectText] = useState<string>("");
   const [selected, setSelected] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
@@ -128,10 +79,6 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
-  const [structuring, setStructuring] = useState(false);
-  const [sourceAnswerKey, setSourceAnswerKey] = useState<string[]>([]);
-  const [sourceSlotCount, setSourceSlotCount] = useState<number>(1);
-  const [sourcePrefixMode, setSourcePrefixMode] = useState<"none" | "hasPrefix">("none");
   const [similarity, setSimilarity] = useState<number | null>(null);
   const [similarityBreakdown, setSimilarityBreakdown] = useState<SimilarityBreakdown | null>(null);
   const [choiceIntent, setChoiceIntent] = useState<ChoiceIntent | null>(null);
@@ -143,34 +90,6 @@ export default function Home() {
     stage?: string;
   } | null>(null);
   const [lastTargetSource, setLastTargetSource] = useState<string | null>(null);
-  const parsedBlank = useMemo(() => parsePrimaryBlank(question), [question]);
-  const sortedContextSlots = useMemo(
-    () => [...contextSlots].sort((a, b) => a.start - b.start),
-    [contextSlots]
-  );
-  const displayContextSlots = useMemo(
-    () =>
-      sortedContextSlots.map((slot, idx) => {
-        const answer = (contextAnswerKey[idx] || "").trim().toLowerCase();
-        const rawPrefix = slot.prefix || "";
-        const prefixValid = Boolean(rawPrefix) && answer.startsWith(rawPrefix.toLowerCase());
-        let uiPrefix = prefixValid ? rawPrefix : "";
-        if (!prefixValid && sourcePrefixMode === "hasPrefix" && answer.length >= 3) {
-          const inferredLen = Math.max(
-            1,
-            Math.min(3, answer.length - Math.max(2, Math.min(slot.missingCount, answer.length - 1)))
-          );
-          uiPrefix = answer.slice(0, inferredLen);
-        }
-        const uiMissingCount = uiPrefix
-          ? Math.max(answer.length - uiPrefix.length, 1)
-          : Math.max(answer.length, 1);
-        const detachedPrefix =
-          prefixValid || sourcePrefixMode === "hasPrefix" ? "" : rawPrefix;
-        return { ...slot, uiPrefix, uiMissingCount, detachedPrefix };
-      }),
-    [sortedContextSlots, contextAnswerKey, sourcePrefixMode]
-  );
 
   useEffect(() => {
     fetch(`${apiBase}/difficulty/weights`)
@@ -178,66 +97,6 @@ export default function Home() {
       .then((data) => setWeights(data.weights))
       .catch(() => setWeights(null));
   }, [apiBase]);
-
-  const runInternalPreprocess = async (): Promise<string | null> => {
-    let input = baselineSources.trim();
-    if (!input) {
-      setError("Paste an example first.");
-      return null;
-    }
-
-    setStructuring(true);
-    try {
-      const res = await fetch(`${apiBase}/ocr/structure`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: input,
-          preferredTaskType: taskType,
-        }),
-      });
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error || "Structuring failed.");
-      }
-      const data = (await res.json()) as {
-        taskType?: "context_completion" | "guided_reading";
-        normalizedText?: string;
-        displayText?: string;
-        answerKey?: string[];
-        payload?: {
-          taskType?: TaskType;
-          displayText?: string;
-          sourceAnswerKey?: string[];
-          slotCount?: number;
-          extraction?: { prefixMode?: "none" | "hasPrefix" };
-        };
-      };
-      const payload = data.payload;
-      const normalized = (payload?.displayText || data.displayText || data.normalizedText || input).trim();
-      setSourceAnswerKey(
-        Array.isArray(payload?.sourceAnswerKey)
-          ? payload.sourceAnswerKey
-          : Array.isArray(data.answerKey)
-          ? data.answerKey
-          : []
-      );
-      const fromPayload = Number(payload?.slotCount || 0);
-      const fromText = countBlanksInText(normalized);
-      const fromAnswerKey = Array.isArray(payload?.sourceAnswerKey)
-        ? payload.sourceAnswerKey.length
-        : Array.isArray(data.answerKey)
-        ? data.answerKey.length
-        : 0;
-      const inferredSlotCount = Math.max(fromPayload, fromText, fromAnswerKey, 1);
-      setSourceSlotCount(Math.max(1, Math.min(2, inferredSlotCount)));
-      setSourcePrefixMode(payload?.extraction?.prefixMode === "hasPrefix" ? "hasPrefix" : "none");
-      setBaselineSources(normalized);
-      return normalized;
-    } finally {
-      setStructuring(false);
-    }
-  };
 
   const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
   const adjustedTarget = useMemo(() => {
@@ -288,7 +147,6 @@ export default function Home() {
       setTargetBand(null);
       setAxisTolerance(null);
       setSelected(null);
-      setTypedAnswer("");
       return null;
     } finally {
       setLoading(false);
@@ -344,7 +202,6 @@ export default function Home() {
         stage: data.debug?.stage,
       });
       setSelected(null);
-      setTypedAnswer("");
       setSubmitted(false);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
@@ -364,7 +221,10 @@ export default function Home() {
     setError(null);
     setWarning(null);
     try {
-      const normalizedSource = await runInternalPreprocess();
+      const normalizedSource = normalizeSourceText(baselineSources);
+      if (normalizedSource !== baselineSources) {
+        setBaselineSources(normalizedSource);
+      }
       if (!normalizedSource) return;
       const normalizedKey = normalizedSource.trim();
       const needsTargetRecalc = !target || !lastTargetSource || lastTargetSource !== normalizedKey;
@@ -514,7 +374,7 @@ export default function Home() {
 
         <div className="actions" style={{ marginTop: 4 }}>
           <button onClick={handleSetAndGenerate} disabled={loading}>
-            {loading || structuring ? "Working..." : "Generate"}
+            {loading ? "Working..." : "Generate"}
           </button>
           <button onClick={handleRegenerate} disabled={loading || !target}>
             {loading ? "Working..." : "Regenerate"}
