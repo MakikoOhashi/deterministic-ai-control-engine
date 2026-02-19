@@ -367,7 +367,13 @@ For `count=1`, range-based interpretation (`targetBand`) is prioritized over poi
 
 - Backend: Node.js, TypeScript, Express
 - Frontend: Next.js 14, React
-- Providers: Gemini generation/embedding (or dummy embeddings for local fallback)
+- Generation: DigitalOcean Gradient Serverless Inference
+- Embeddings/Evaluation: Gemini embeddings (or dummy embeddings for local fallback)
+
+Design note:
+
+> Generation runs on DigitalOcean Gradient Serverless Inference.  
+> Embeddings remain on Gemini because Serverless inference currently exposes generation models only; the embedding provider is abstracted and swappable.
 
 ---
 
