@@ -75,6 +75,15 @@ Backend production scripts:
 - `npm run build` → `tsc -p tsconfig.v1.json`
 - `npm start` → `node dist/backend/src/index.js`
 
+Recommended backend env vars:
+
+```text
+GRADIENT_API_KEY=...
+GRADIENT_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct
+# optional
+GRADIENT_BASE_URL=https://api.gradient.ai/v1
+```
+
 Health check:
 
 ```text
