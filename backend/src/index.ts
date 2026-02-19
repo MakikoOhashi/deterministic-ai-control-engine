@@ -34,7 +34,6 @@ import { validateGenerated } from "./services/format-validator.service.js";
 import { cosineSimilarity } from "./utils/cosine.js";
 import { countWords } from "./utils/text-metrics.js";
 import {
-  GeminiTextGenerationProvider,
   type TextGenerationProvider,
 } from "./providers/gemini.generate.provider.js";
 import { GradientTextGenerationProvider } from "./providers/gradient.generate.provider.js";
@@ -87,15 +86,11 @@ const embeddingProvider: EmbeddingProvider = (() => {
 const generationProvider: TextGenerationProvider | null = (() => {
   const gradientApiKey = process.env.GRADIENT_API_KEY;
   if (gradientApiKey) {
-    const model = process.env.GRADIENT_MODEL || "meta-llama/Meta-Llama-3.1-8B-Instruct";
-    const baseUrl = process.env.GRADIENT_BASE_URL || "https://api.gradient.ai/v1";
+    const model = process.env.GRADIENT_MODEL || "llama3.3-70b-instruct";
+    const baseUrl = process.env.GRADIENT_BASE_URL || "https://inference.do-ai.run/v1";
     return new GradientTextGenerationProvider(gradientApiKey, model, baseUrl);
   }
-
-  const geminiApiKey = process.env.GEMINI_API_KEY;
-  if (!geminiApiKey) return null;
-  const model = process.env.GEMINI_GENERATION_MODEL || "gemini-2.5-flash";
-  return new GeminiTextGenerationProvider(geminiApiKey, model);
+  return null;
 })();
 
 app.get("/health", (_req, res) => {

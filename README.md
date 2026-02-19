@@ -79,9 +79,9 @@ Recommended backend env vars:
 
 ```text
 GRADIENT_API_KEY=...
-GRADIENT_MODEL=meta-llama/Meta-Llama-3.1-8B-Instruct
+GRADIENT_MODEL=llama3.3-70b-instruct
 # optional
-GRADIENT_BASE_URL=https://api.gradient.ai/v1
+GRADIENT_BASE_URL=https://inference.do-ai.run/v1
 ```
 
 Health check:
