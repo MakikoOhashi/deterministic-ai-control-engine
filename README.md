@@ -402,6 +402,11 @@ Design note:
 > Generation runs on DigitalOcean Gradient Serverless Inference.  
 > Embeddings remain on Gemini because Serverless inference currently exposes generation models only; the embedding provider is abstracted and swappable.
 
+Additional rationale:
+
+> Gradient AI Platform provides embedding models optimized for knowledge base indexing and RAG workflows, where embeddings are stored and queried via OpenSearch.  
+> Our evaluation engine requires real-time, on-the-fly embeddings for deterministic similarity scoring, so we intentionally keep embeddings on Gemini while using Gradient Serverless Inference for generation.
+
 ---
 
 ## Project Positioning
