@@ -1,6 +1,7 @@
 # Stable Difficulty Generation Engine
 
 A demo that evaluates and controls AI-generated questions by measuring difficulty and similarity — not just generating them.
+A system for *evaluation-first controlled generation* of inference questions.
 
 ## Overview
 This project is a **Guided Reading item generation engine** for English learning.
@@ -166,7 +167,7 @@ https://deterministic-ai-control-engine-dkcf4.ondigitalocean.app/
 ## Why DigitalOcean
 
 We leveraged **DigitalOcean App Platform** to deploy a reproducible service (backend + static frontend) with minimal infrastructure overhead.  
-We use **DigitalOcean Gradient™ AI Serverless Inference** for controlled question generation, which integrates smoothly via an OpenAI-compatible endpoint and satisfies the hackathon requirements.
+We use **DigitalOcean Gradient™ AI Serverless Inference** for controlled question generation, which integrates smoothly via an OpenAI-compatible endpoint to satisfy hackathon requirements.
 
 ---
 
