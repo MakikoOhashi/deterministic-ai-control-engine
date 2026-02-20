@@ -382,7 +382,6 @@ For `count=1`, range-based interpretation (`targetBand`) is prioritized over poi
 
 ## Notes
 
-- `GET /favicon.ico 404` from frontend dev server is non-blocking.
 - If frontend shows `ERR_CONNECTION_REFUSED` for `:3001`, backend is not running.
 - If you see `Failed to parse multiple-choice input`, ensure one full item is pasted (passage + one question + one 4-choice set).
 - If `GET /difficulty/weights` returns `404` in production, `NEXT_PUBLIC_API_BASE` is likely pointing to the wrong base path (missing backend prefix).
