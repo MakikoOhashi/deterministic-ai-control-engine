@@ -86,7 +86,7 @@ const embeddingProvider: EmbeddingProvider = (() => {
 const generationProvider: TextGenerationProvider | null = (() => {
   const gradientApiKey = process.env.GRADIENT_API_KEY;
   if (gradientApiKey) {
-    const model = process.env.GRADIENT_MODEL || "llama3.3-70b-instruct";
+    const model = process.env.GRADIENT_MODEL || "llama3-8b-instruct";
     const baseUrl = process.env.GRADIENT_BASE_URL || "https://inference.do-ai.run/v1";
     return new GradientTextGenerationProvider(gradientApiKey, model, baseUrl);
   }

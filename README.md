@@ -108,7 +108,7 @@ Recommended backend env vars:
 
 ```text
 GRADIENT_API_KEY=...
-GRADIENT_MODEL=llama3.3-70b-instruct
+GRADIENT_MODEL=llama3-8b-instruct
 # optional
 GRADIENT_BASE_URL=https://inference.do-ai.run/v1
 ```
