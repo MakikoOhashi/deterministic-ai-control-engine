@@ -1,4 +1,4 @@
-# Difficulty Evaluation-Guided Generation Engine
+# Stable Difficulty Generation Engine
 
 ## Overview
 This project is a **Guided Reading item generation engine** for English learning.
@@ -35,7 +35,7 @@ traceable run metadata (`runId`, `sourceId`, `candidateId`, `debug.stage`).
 - Generate / Regenerate workflow
 - Inference style selector (`fact_based` / `intent_based` / `emotional`)
 
-### Out of scope (v2+)
+### Not included in v1
 - Context Completion (fill-blank)
 - Mode B (concept preservation)
 - OCR / image upload path in UI
@@ -428,4 +428,3 @@ not a full consumer test-prep app.
 - Deployment: complete
 - End-to-end flow: passed
 - Gradient inference: verified (`/v1/models` and `/v1/chat/completions`)
-- Next step: demo recording and submission packaging

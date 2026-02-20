@@ -1,8 +1,8 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "Difficulty Control Console",
-  description: "Deterministic AI Control Engine",
+  title: "Stable Difficulty Generation Engine",
+  description: "Evaluation-controlled generation engine for guided reading items",
 };
 
 export default function RootLayout({
