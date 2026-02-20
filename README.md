@@ -1,5 +1,7 @@
 # Stable Difficulty Generation Engine
 
+A demo that evaluates and controls AI-generated questions by measuring difficulty and similarity — not just generating them.
+
 ## Overview
 This project is a **Guided Reading item generation engine** for English learning.
 The goal is not raw content generation; it is **evaluation-driven control**:
@@ -23,6 +25,13 @@ It demonstrates a deterministic control pattern over probabilistic generation:
 
 Engine decisions are made through measurable metrics and explicit thresholds, with
 traceable run metadata (`runId`, `sourceId`, `candidateId`, `debug.stage`).
+
+---
+
+## Objective
+
+- Move beyond black-box generation: measure, evaluate, and control AI outputs.
+- Provide **observable and reproducible difficulty-aware generation** for inference problems.
 
 ---
 
@@ -156,9 +165,8 @@ https://deterministic-ai-control-engine-dkcf4.ondigitalocean.app/
 
 ## Why DigitalOcean
 
-- Low-friction deploy path for split architecture (Web Service + Static Site)
-- Reproducible AI pipeline with explicit env/config controls
-- Clear operational boundary between generation/evaluation backend and demo frontend
+We leveraged **DigitalOcean App Platform** to deploy a reproducible service (backend + static frontend) with minimal infrastructure overhead.  
+We use **DigitalOcean Gradient™ AI Serverless Inference** for controlled question generation, which integrates smoothly via an OpenAI-compatible endpoint and satisfies the hackathon requirements.
 
 ---
 
@@ -408,6 +416,19 @@ Additional rationale:
 
 ---
 
+## Models and Decisions
+
+- **Gradient Serverless Inference** — `llama3-8b-instruct` used for generation.
+- **Embeddings** remain on Gemini (current embedding API in Gradient is focused on RAG/knowledge bases, not on-the-fly similarity scoring).
+
+---
+
+## Soft-accept Behavior
+
+For soft-accepted candidates, similarity breakdown is intentionally omitted (`null` -> `--`) to indicate structurally valid but not fully inferred problems.
+
+---
+
 ## Project Positioning
 
 This repository demonstrates an **evaluation-controlled generation engine**,
@@ -418,7 +439,14 @@ not a full consumer test-prep app.
 ## Live Demo
 
 - Frontend: `https://deterministic-ai-control-engine-dkcf4.ondigitalocean.app/`
-- Flow: paste one reference item → generate/regenerate → run audit → inspect acceptance trace
+
+### Try it out
+
+1. Paste an example passage + question + choices.
+2. Click **Generate** to produce a candidate question.
+3. Click **Run Audit** to evaluate difficulty and similarity.
+4. Adjust sliders (`L / S / A / R`) to steer generation.
+5. Modify **Inference Style** to observe effects.
 
 ---
 
