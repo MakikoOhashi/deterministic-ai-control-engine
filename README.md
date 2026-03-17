@@ -3,6 +3,8 @@
 A demo that evaluates and controls AI-generated questions by measuring difficulty and similarity — not just generating them.
 A system for *evaluation-first controlled generation* of inference questions.
 
+License: MIT. See [LICENSE](/Users/makiko/Documents/Documents%20-%20makiko%E2%80%99s%20MacBook%20Air/dev/deterministic-ai-control-engine/LICENSE).
+
 ## Overview
 This project is a **Guided Reading item generation engine** for English learning.
 The goal is not raw content generation; it is **evaluation-driven control**:
