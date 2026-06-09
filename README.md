@@ -1,3 +1,13 @@
+---
+
+## Project Status
+
+Archived after hackathon submission.
+
+This repository is preserved as a completed experiment exploring evaluation-first control of AI-generated questions. No further development is planned.
+
+---
+
 # Stable Difficulty Generation Engine
 
 A demo that evaluates and controls AI-generated questions by measuring difficulty and similarity — not just generating them.
